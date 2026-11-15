@@ -18,6 +18,8 @@ import {
   Crosshair,
   Loader2,
   Sparkles,
+  ChevronUp,
+  ChevronDown,
 } from "lucide-react";
 
 interface Props {
@@ -39,14 +41,23 @@ const MAX_X = 380; // límite de arrastre horizontal sin zoom (px)
 const MAX_Y = 220; // límite de arrastre vertical sin zoom (px)
 
 const MIN_ZOOM = 0.8;
-const MAX_ZOOM = 2.6;
-// Zoom al enfocar un módulo: los lejanos (Marte, ISS) necesitan más aumento.
-const FOCUS_ZOOM_NEAR = 1.9;
-const FOCUS_ZOOM_FAR = 2.4;
-// Punto de la pantalla donde queda el módulo enfocado (fracción del ancho y alto).
-// Va algo a la izquierda y abajo para no quedar bajo el panel ni la telemetría.
-const FOCUS_X = 0.44;
-const FOCUS_Y = 0.6;
+const MAX_ZOOM = 3;
+
+// Anchos (px) a partir de los cuales cambia la distribución.
+const PHONE_MAX = 640;
+const TABLET_MAX = 1024;
+
+/**
+ * Encuadre de cámara según el tamaño de pantalla.
+ * x, y: punto donde queda el módulo enfocado (fracción del ancho y alto),
+ * elegido para que no caiga bajo el título ni bajo el panel.
+ * near, far: zoom para módulos cercanos (Luna) y lejanos (Marte, ISS).
+ */
+function focusPreset(width: number) {
+  if (width < PHONE_MAX) return { x: 0.5, y: 0.3, near: 2.4, far: 2.9 };
+  if (width < TABLET_MAX) return { x: 0.38, y: 0.52, near: 2.0, far: 2.5 };
+  return { x: 0.44, y: 0.6, near: 1.9, far: 2.4 };
+}
 
 const clamp = (v: number, min: number, max: number) =>
   Math.min(max, Math.max(min, v));
@@ -86,7 +97,7 @@ type Spot = {
   where: "mid" | "lunar" | "rover";
   x: string; // posición del botón (% de su contenedor)
   y: string;
-  fx: number; // punto aproximado al que "vuela" la cámara
+  fx: number; // punto aproximado de respaldo, si no se puede medir el real
   fy: number;
   depth: number;
   accent: string;
@@ -555,6 +566,7 @@ function Hotspot({
   spot,
   selected,
   lang,
+  compact,
   onSelect,
   didDrag,
   style,
@@ -563,21 +575,28 @@ function Hotspot({
   spot: Spot;
   selected: boolean;
   lang: "ES" | "EN";
+  /** En teléfonos solo se rotula el módulo activo, para que no se pisen. */
+  compact: boolean;
   onSelect: (key: string) => void;
   didDrag: React.MutableRefObject<boolean>;
   style: React.CSSProperties;
 }) {
   const label = lang === "ES" ? spot.tagEs : spot.tagEn;
+  const showLabel = !compact || selected;
   return (
     <button
       type="button"
+      data-spot={env.key}
       onClick={() => {
         if (!didDrag.current) onSelect(env.key);
       }}
       aria-pressed={selected}
       aria-label={label}
+      title={label}
       style={{ ...style, boxShadow: selected ? `0 0 26px ${spot.glow}` : undefined }}
-      className={`group pointer-events-auto absolute z-10 flex -translate-x-1/2 -translate-y-1/2 cursor-pointer items-center gap-2 whitespace-nowrap rounded-full border px-3 py-1.5 backdrop-blur-md transition-all duration-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300 ${
+      className={`group pointer-events-auto absolute z-10 flex -translate-x-1/2 -translate-y-1/2 cursor-pointer items-center gap-2 whitespace-nowrap rounded-full border backdrop-blur-md transition-all duration-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300 ${
+        showLabel ? "px-3 py-1.5" : "p-2"
+      } ${
         selected
           ? "scale-110 border-teal-300 bg-teal-950/95 text-teal-300"
           : `bg-slate-950/85 hover:scale-105 ${spot.accent}`
@@ -593,9 +612,11 @@ function Hotspot({
           }`}
         />
       </span>
-      <span className="font-hud text-[11px] font-semibold tracking-wider text-slate-100">
-        {label}
-      </span>
+      {showLabel && (
+        <span className="font-hud text-[11px] font-semibold tracking-wider text-slate-100">
+          {label}
+        </span>
+      )}
       <span
         aria-hidden
         className="absolute left-1/2 top-full h-5 w-px -translate-x-1/2 bg-gradient-to-b from-current to-transparent opacity-60"
@@ -620,11 +641,19 @@ export function CommandViewport({
   const es = lang === "ES";
   const rootRef = useRef<HTMLDivElement>(null);
 
-  // Panel inferior: lista de ambientes o hallazgos del ambiente activo.
+  // Panel de misión: lista de ambientes o hallazgos del ambiente activo.
   const [panelTab, setPanelTab] = useState<"env" | "findings">("env");
   const [pickedKey, setPickedKey] = useState<string | null>(null);
+  // En teléfonos el panel es una hoja inferior que se pliega para ver la escena.
+  const [sheetOpen, setSheetOpen] = useState(false);
+  const [compact, setCompact] = useState(false);
   // Encuadre de cámara activo (se muestra la mira mientras está enfocado).
-  const [focus, setFocus] = useState<{ label: string; zoom: number } | null>(null);
+  const [focus, setFocus] = useState<{
+    label: string;
+    zoom: number;
+    x: number;
+    y: number;
+  } | null>(null);
   const focusedRef = useRef(false);
 
   // Estado del movimiento: se actualiza directo en el DOM para mantener 60 fps.
@@ -637,6 +666,9 @@ export function CommandViewport({
     lx: number; ly: number; lt: number; active: boolean;
   } | null>(null);
   const didDrag = useRef(false);
+  // Dedos sobre la escena, para el zoom con pellizco.
+  const pointers = useRef(new Map<number, { x: number; y: number }>());
+  const pinch = useRef<{ startDist: number; startZoom: number } | null>(null);
 
   const envRef = useRef(environments);
   envRef.current = environments;
@@ -653,6 +685,15 @@ export function CommandViewport({
   const roverEntry = spots.find((s) => s.spot.kind === "rover");
   const activeSpot = spots.find((s) => s.env.key === active?.key)?.spot;
 
+  /* ---- Tamaño de pantalla: se lee en un efecto para no romper el prerender ---- */
+  useEffect(() => {
+    const mq = window.matchMedia(`(max-width: ${PHONE_MAX - 1}px)`);
+    const apply = () => setCompact(mq.matches);
+    apply();
+    mq.addEventListener("change", apply);
+    return () => mq.removeEventListener("change", apply);
+  }, []);
+
   /** Con zoom se puede arrastrar más lejos sin perder la escena. */
   const limits = () => {
     const root = rootRef.current;
@@ -667,6 +708,7 @@ export function CommandViewport({
   const selectEnv = (key: string) => {
     onSelectEnv(key);
     setPanelTab("findings");
+    setSheetOpen(true);
   };
 
   /* ---- Bucle de movimiento: inercia, zoom suave, vuelo de cámara y deriva ---- */
@@ -739,32 +781,81 @@ export function CommandViewport({
     if (!root || idx < 0) return;
 
     const spot = getVisualSpot(list[idx], idx);
-    const zoom = spot.depth >= 1 ? FOCUS_ZOOM_NEAR : FOCUS_ZOOM_FAR;
-    // Escala real de la capa donde vive el módulo.
-    const layerScale = 1 + (zoom - 1) * spot.depth;
     const W = root.clientWidth;
     const H = root.clientHeight;
+    const preset = focusPreset(W);
+    const zoom = spot.depth >= 1 ? preset.near : preset.far;
+    // Escala real de la capa donde vive el módulo.
+    const layerScale = 1 + (zoom - 1) * spot.depth;
+    const p = pan.current;
+
+    // Posición real del módulo: se mide su marcador en pantalla y se deshace
+    // la transformación actual de la capa. Así apunta bien en cualquier tamaño.
+    let fx = spot.fx;
+    let fy = spot.fy;
+    const marker = Array.from(
+      root.querySelectorAll<HTMLElement>("[data-spot]")
+    ).find((node) => node.dataset.spot === activeEnvKey);
+
+    if (marker) {
+      const rootRect = root.getBoundingClientRect();
+      const rect = marker.getBoundingClientRect();
+      const screenX = rect.left + rect.width / 2 - rootRect.left;
+      const screenY = rect.top + rect.height / 2 - rootRect.top;
+      const curPx = parseFloat(root.style.getPropertyValue("--px")) || 0;
+      const curPy = parseFloat(root.style.getPropertyValue("--py")) || 0;
+      const curScale = 1 + (p.z - 1) * spot.depth;
+
+      const baseX = W / 2 + (screenX - W / 2 - curPx * spot.depth) / curScale;
+      const baseY = H / 2 + (screenY - H / 2 - curPy * spot.depth) / curScale;
+      // El objeto no está justo en la etiqueta: Marte y la ISS quedan encima,
+      // y los módulos lunares, debajo.
+      const offsetY = spot.where === "mid" ? -0.07 * H : 30;
+
+      fx = baseX / W;
+      fy = (baseY + offsetY) / H;
+    }
 
     // Se desplaza la escena para que el módulo, ya ampliado, caiga en el punto de foco.
-    const p = pan.current;
     p.tz = zoom;
-    p.tx = ((FOCUS_X - 0.5) * W - (spot.fx - 0.5) * W * layerScale) / spot.depth;
-    p.ty = ((FOCUS_Y - 0.5) * H - (spot.fy - 0.5) * H * layerScale) / spot.depth;
+    p.tx = ((preset.x - 0.5) * W - (fx - 0.5) * W * layerScale) / spot.depth;
+    p.ty = ((preset.y - 0.5) * H - (fy - 0.5) * H * layerScale) / spot.depth;
     p.vx = 0;
     p.vy = 0;
     p.fly = true;
 
     focusedRef.current = true;
-    setFocus({ label: list[idx].label, zoom: layerScale });
+    setFocus({ label: list[idx].label, zoom: layerScale, x: preset.x, y: preset.y });
   }, [activeEnvKey]);
 
-  /* ---- Arrastre del espacio (el clic simple sigue llegando a los botones) ---- */
+  /* ---- Arrastre del espacio y zoom con pellizco ---- */
+  const releaseFocus = () => {
+    focusedRef.current = false;
+    setFocus(null);
+  };
+
   const onPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     if (e.pointerType === "mouse" && e.button !== 0) return;
+    pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
     const p = pan.current;
     p.vx = 0;
     p.vy = 0;
     p.fly = false;
+
+    // Segundo dedo: empieza el pellizco y se cancela el arrastre.
+    if (pointers.current.size === 2) {
+      const [a, b] = Array.from(pointers.current.values());
+      pinch.current = {
+        startDist: Math.hypot(a.x - b.x, a.y - b.y) || 1,
+        startZoom: p.tz,
+      };
+      drag.current = null;
+      didDrag.current = true;
+      releaseFocus();
+      return;
+    }
+
     didDrag.current = false;
     drag.current = {
       id: e.pointerId, sx: e.clientX, sy: e.clientY, ox: p.x, oy: p.y,
@@ -773,6 +864,21 @@ export function CommandViewport({
   };
 
   const onPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (pointers.current.has(e.pointerId)) {
+      pointers.current.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    }
+
+    if (pinch.current && pointers.current.size >= 2) {
+      const [a, b] = Array.from(pointers.current.values());
+      const dist = Math.hypot(a.x - b.x, a.y - b.y);
+      pan.current.tz = clamp(
+        pinch.current.startZoom * (dist / pinch.current.startDist),
+        MIN_ZOOM,
+        MAX_ZOOM
+      );
+      return;
+    }
+
     const d = drag.current;
     if (!d || d.id !== e.pointerId) return;
     const dx = e.clientX - d.sx;
@@ -785,8 +891,7 @@ export function CommandViewport({
       e.currentTarget.setPointerCapture(e.pointerId);
       e.currentTarget.style.cursor = "grabbing";
       // Al mover la escena a mano se suelta el encuadre.
-      focusedRef.current = false;
-      setFocus(null);
+      releaseFocus();
     }
 
     const p = pan.current;
@@ -801,6 +906,9 @@ export function CommandViewport({
   };
 
   const endDrag = (e: React.PointerEvent<HTMLDivElement>) => {
+    pointers.current.delete(e.pointerId);
+    if (pointers.current.size < 2) pinch.current = null;
+
     const d = drag.current;
     if (!d || d.id !== e.pointerId) return;
     if (performance.now() - d.lt > 80) {
@@ -822,8 +930,7 @@ export function CommandViewport({
     p.vx = 0;
     p.vy = 0;
     p.fly = true;
-    focusedRef.current = false;
-    setFocus(null);
+    releaseFocus();
   };
 
   const pickFinding = (f: FindingOut) => {
@@ -841,7 +948,7 @@ export function CommandViewport({
       onPointerUp={endDrag}
       onPointerCancel={endDrag}
       style={rootStyle}
-      className="cmd-root relative h-full min-h-[calc(100vh-3.5rem)] w-full touch-none select-none overflow-hidden bg-[radial-gradient(ellipse_at_top,#0f1f3d_0%,#050a14_72%)]"
+      className="cmd-root relative h-full min-h-[calc(100dvh-3.5rem)] w-full touch-none select-none overflow-hidden bg-[radial-gradient(ellipse_at_top,#0f1f3d_0%,#050a14_72%)]"
     >
       <style>{`
         @keyframes twinkle { 0%,100% { opacity: .25 } 50% { opacity: 1 } }
@@ -967,10 +1074,12 @@ export function CommandViewport({
           />
         </div>
 
-        {/* ISS */}
-        <div className="absolute left-[62%] top-[22%] hidden -translate-x-1/2 -translate-y-1/2 sm:block">
-          <div className="cmd-float">
-            <IssSvg />
+        {/* ISS: en teléfonos se muestra más pequeña en lugar de ocultarse */}
+        <div className="absolute left-[62%] top-[22%] -translate-x-1/2 -translate-y-1/2">
+          <div className="origin-center scale-[0.55] sm:scale-100">
+            <div className="cmd-float">
+              <IssSvg />
+            </div>
           </div>
         </div>
 
@@ -983,6 +1092,7 @@ export function CommandViewport({
               spot={spot}
               selected={env.key === activeEnvKey}
               lang={lang}
+              compact={compact}
               onSelect={selectEnv}
               didDrag={didDrag}
               style={{ left: spot.x, top: spot.y }}
@@ -1000,27 +1110,30 @@ export function CommandViewport({
         <Floater
           boundsRef={rootRef}
           start={{ x: 0.5, y: 0.42 }}
-          size={64}
+          size={compact ? 44 : 64}
           vx0={0.5}
           vy0={-0.3}
           label={es ? "Astronauta: arrástralo y suéltalo" : "Astronaut: drag and release"}
         >
           <AstronautSvg />
         </Floater>
-        <Floater
-          boundsRef={rootRef}
-          start={{ x: 0.82, y: 0.55 }}
-          size={84}
-          vx0={-0.4}
-          vy0={0.25}
-          label={es ? "Satélite: arrástralo y suéltalo" : "Satellite: drag and release"}
-        >
-          <SatelliteSvg />
-        </Floater>
+        {/* En teléfonos hay menos espacio: el satélite se omite */}
+        {!compact && (
+          <Floater
+            boundsRef={rootRef}
+            start={{ x: 0.82, y: 0.55 }}
+            size={84}
+            vx0={-0.4}
+            vy0={0.25}
+            label={es ? "Satélite: arrástralo y suéltalo" : "Satellite: drag and release"}
+          >
+            <SatelliteSvg />
+          </Floater>
+        )}
         <Floater
           boundsRef={rootRef}
           start={{ x: 0.28, y: 0.34 }}
-          size={52}
+          size={compact ? 38 : 52}
           vx0={0.3}
           vy0={0.4}
           label={es ? "Llama esférica: así arde el fuego en 0 g" : "Spherical flame: how fire burns in 0 g"}
@@ -1047,8 +1160,8 @@ export function CommandViewport({
           <div className="absolute left-[76%] top-[24%] h-[4.5%] w-[10%] rounded-full border-b border-slate-300/15 bg-slate-950/30" />
         </div>
 
-        {/* Complejo lunar: cohete, hábitats, antena, rover */}
-        <div className="absolute bottom-[11%] left-[14%] aspect-[760/300] w-[min(64vw,780px)]">
+        {/* Complejo lunar: en teléfonos va más grande y más arriba, sobre la hoja inferior */}
+        <div className="absolute bottom-[24%] left-[7%] aspect-[760/300] w-[min(86vw,780px)] sm:bottom-[11%] sm:left-[14%] sm:w-[min(64vw,780px)]">
           <svg viewBox="0 0 760 300" className="absolute inset-0 h-full w-full overflow-visible drop-shadow-[0_12px_24px_rgba(2,6,23,0.75)]" fill="none">
             <defs>
               <linearGradient id="cmdHab" x1="0" y1="0" x2="1" y2="1">
@@ -1136,6 +1249,7 @@ export function CommandViewport({
                 spot={spot}
                 selected={env.key === activeEnvKey}
                 lang={lang}
+                compact={compact}
                 onSelect={selectEnv}
                 didDrag={didDrag}
                 style={{ left: spot.x, top: spot.y }}
@@ -1153,6 +1267,7 @@ export function CommandViewport({
                 spot={roverEntry.spot}
                 selected={roverEntry.env.key === activeEnvKey}
                 lang={lang}
+                compact={compact}
                 onSelect={selectEnv}
                 didDrag={didDrag}
                 style={{ left: "50%", top: "-22px" }}
@@ -1184,8 +1299,8 @@ export function CommandViewport({
         <div
           key={focus.label}
           aria-hidden
-          className="cmd-reticle pointer-events-none absolute z-[5] hidden h-52 w-72 md:block"
-          style={{ left: `${FOCUS_X * 100}%`, top: `${FOCUS_Y * 100}%` }}
+          className="cmd-reticle pointer-events-none absolute z-[5] h-32 w-48 sm:h-44 sm:w-64 lg:h-52 lg:w-72"
+          style={{ left: `${focus.x * 100}%`, top: `${focus.y * 100}%` }}
         >
           {/* Esquinas del encuadre */}
           <span className="absolute left-0 top-0 h-5 w-5 border-l-2 border-t-2 border-teal-300/80" />
@@ -1195,8 +1310,8 @@ export function CommandViewport({
           {/* Línea de barrido */}
           <span className="cmd-scan absolute inset-x-3 h-px bg-gradient-to-r from-transparent via-teal-300/70 to-transparent" />
           {/* Etiqueta de cámara */}
-          <span className="absolute -top-6 left-0 flex items-center gap-1.5 whitespace-nowrap font-hud text-[10px] uppercase tracking-[0.18em] text-teal-200">
-            <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-rose-400" />
+          <span className="absolute -top-6 left-0 flex max-w-full items-center gap-1.5 truncate whitespace-nowrap font-hud text-[10px] uppercase tracking-[0.18em] text-teal-200">
+            <span className="h-1.5 w-1.5 shrink-0 animate-pulse rounded-full bg-rose-400" />
             CAM · {focus.label} · ×{focus.zoom.toFixed(1)}
           </span>
         </div>
@@ -1206,23 +1321,26 @@ export function CommandViewport({
       <div
         data-hud
         onPointerDown={stop}
-        className="relative z-10 max-w-xl cursor-default pl-6 pr-6 pt-5 sm:pl-10"
+        className="relative z-10 max-w-xl cursor-default pl-4 pr-4 pt-3 sm:pl-10 sm:pr-6 sm:pt-5"
       >
-        <div className="inline-flex items-center gap-2 font-hud text-[11px] uppercase tracking-[0.22em] text-teal-400">
-          <Radio className="h-3.5 w-3.5 animate-pulse" />
-          <span>
-            {es ? "CENTRO DE MANDO · " : "COMMAND CENTER · "}
+        {/* En teléfonos esta línea deja sitio a los controles de cámara de la derecha */}
+        <div className="flex min-h-9 items-center gap-2 pr-28 font-hud text-[11px] uppercase tracking-[0.22em] text-teal-400 sm:min-h-0 sm:pr-0">
+          <Radio className="h-3.5 w-3.5 shrink-0 animate-pulse" />
+          <span className="truncate">
+            <span className="hidden sm:inline">
+              {es ? "CENTRO DE MANDO · " : "COMMAND CENTER · "}
+            </span>
             {active?.label || "SITIO LUNAR"}
           </span>
         </div>
 
-        <h1 className="mt-1.5 text-2xl font-bold leading-tight tracking-tight text-white sm:text-3xl">
+        <h1 className="mt-1 text-xl font-bold leading-tight tracking-tight text-white sm:mt-1.5 sm:text-3xl">
           {es
             ? "Seguridad contra incendios en ambientes habitables"
             : "Fire safety in habitable environments"}
         </h1>
 
-        <div className="mt-2.5 inline-flex items-center gap-2 rounded-full border border-slate-700/80 bg-slate-900/85 px-3 py-1 text-xs text-slate-300">
+        <div className="mt-2.5 hidden items-center gap-2 rounded-full border border-slate-700/80 bg-slate-900/85 px-3 py-1 text-xs text-slate-300 sm:inline-flex">
           <Flame className="h-3.5 w-3.5 text-teal-400" />
           <span>
             {es
@@ -1231,8 +1349,9 @@ export function CommandViewport({
           </span>
         </div>
 
+        {/* Telemetría: en teléfonos la resume la cabecera de la hoja inferior */}
         {active && (
-          <div className="mt-4 rounded-xl border border-slate-800/90 bg-slate-950/80 p-3 shadow-xl backdrop-blur-md">
+          <div className="mt-4 hidden rounded-xl border border-slate-800/90 bg-slate-950/80 p-3 shadow-xl backdrop-blur-md sm:block">
             <div className="flex items-center justify-between gap-2 font-hud text-[10px] text-slate-400">
               <span className="font-semibold uppercase text-teal-300">
                 {es ? "TELEMETRÍA" : "TELEMETRY"} · {active.label}
@@ -1296,31 +1415,13 @@ export function CommandViewport({
             </div>
           </div>
         )}
-
-        {/* Selector rápido en pantallas medianas y pequeñas */}
-        <div className="mt-3 flex flex-wrap gap-1.5 lg:hidden">
-          {environments.map((env) => (
-            <button
-              key={env.key}
-              type="button"
-              onClick={() => selectEnv(env.key)}
-              className={`cursor-pointer rounded-lg border px-2.5 py-1 font-hud text-[11px] transition ${
-                env.key === activeEnvKey
-                  ? "border-teal-400 bg-teal-500/20 text-teal-200"
-                  : "border-slate-800 bg-slate-900/85 text-slate-400"
-              }`}
-            >
-              {env.label} ({Math.round(env.o2_fraction * 100)}% O₂)
-            </button>
-          ))}
-        </div>
       </div>
 
       {/* ===== Controles de cámara ===== */}
       <div
         data-hud
         onPointerDown={stop}
-        className="absolute right-4 top-4 z-20 flex cursor-default items-center gap-1 rounded-full border border-slate-700/80 bg-slate-950/85 p-1 backdrop-blur-md"
+        className="absolute right-2 top-3 z-20 flex cursor-default items-center gap-0.5 rounded-full border border-slate-700/80 bg-slate-950/85 p-1 backdrop-blur-md sm:right-4 sm:top-4 sm:gap-1"
       >
         <span className="hidden items-center gap-1.5 pl-2.5 pr-1 text-[11px] text-slate-300 md:inline-flex">
           <Move className="h-3.5 w-3.5 text-teal-300" />
@@ -1331,7 +1432,7 @@ export function CommandViewport({
           onClick={() => zoomBy(-0.25)}
           aria-label={es ? "Alejar" : "Zoom out"}
           title={es ? "Alejar" : "Zoom out"}
-          className="cursor-pointer rounded-full p-1.5 text-slate-300 hover:bg-slate-800 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300"
+          className="cursor-pointer rounded-full p-2 text-slate-300 hover:bg-slate-800 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300 sm:p-1.5"
         >
           <Minus className="h-3.5 w-3.5" />
         </button>
@@ -1340,7 +1441,7 @@ export function CommandViewport({
           onClick={() => zoomBy(0.25)}
           aria-label={es ? "Acercar" : "Zoom in"}
           title={es ? "Acercar" : "Zoom in"}
-          className="cursor-pointer rounded-full p-1.5 text-slate-300 hover:bg-slate-800 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300"
+          className="cursor-pointer rounded-full p-2 text-slate-300 hover:bg-slate-800 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300 sm:p-1.5"
         >
           <Plus className="h-3.5 w-3.5" />
         </button>
@@ -1349,17 +1450,19 @@ export function CommandViewport({
           onClick={recenter}
           aria-label={es ? "Ver toda la escena" : "Show whole scene"}
           title={es ? "Ver toda la escena" : "Show whole scene"}
-          className="cursor-pointer rounded-full p-1.5 text-teal-300 hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300"
+          className="cursor-pointer rounded-full p-2 text-teal-300 hover:bg-slate-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300 sm:p-1.5"
         >
           <Crosshair className="h-3.5 w-3.5" />
         </button>
       </div>
 
-      {/* ===== Panel de misión: ambientes y hallazgos ===== */}
+      {/* ===== Panel de misión: ambientes y hallazgos =====
+          Teléfono: hoja inferior plegable, por encima del botón de Flamey.
+          Tablet y escritorio: tarjeta flotante abajo a la derecha, siempre abierta. */}
       <div
         data-hud
         onPointerDown={stop}
-        className="absolute bottom-5 right-5 z-20 hidden w-[400px] cursor-default overflow-hidden rounded-2xl border border-slate-700/70 bg-slate-950/92 shadow-[0_24px_70px_rgba(2,6,23,0.85)] backdrop-blur-xl lg:block"
+        className="absolute bottom-16 left-2 right-2 z-20 cursor-default overflow-hidden rounded-2xl border border-slate-700/70 bg-slate-950/92 shadow-[0_24px_70px_rgba(2,6,23,0.85)] backdrop-blur-xl sm:bottom-4 sm:left-auto sm:right-4 sm:w-[380px] lg:bottom-5 lg:right-5 lg:w-[400px]"
       >
         {/* Línea de acento con el color del módulo activo */}
         <div
@@ -1369,22 +1472,27 @@ export function CommandViewport({
           }}
         />
 
-        {/* Ambiente activo */}
-        {active && (
-          <div className="flex items-center gap-3 px-4 pb-2.5 pt-3">
-            <span
-              className="h-9 w-1 shrink-0 rounded-full transition-colors duration-500"
-              style={{
-                background: activeSpot?.color || "#2dd4bf",
-                boxShadow: `0 0 14px ${activeSpot?.glow || "rgba(45,212,191,0.5)"}`,
-              }}
-            />
-            <div className="min-w-0 flex-1">
-              <div className="font-hud text-[10px] tracking-[0.2em] text-slate-400">
-                {activeSpot?.code} · {es ? "AMBIENTE ACTIVO" : "ACTIVE ENVIRONMENT"}
-              </div>
-              <div className="truncate text-sm font-bold text-white">{active.label}</div>
+        {/* Ambiente activo. En teléfonos, tocarlo pliega o despliega la hoja. */}
+        <div
+          onClick={compact ? () => setSheetOpen((v) => !v) : undefined}
+          className="flex items-center gap-3 px-3 pb-2.5 pt-2.5 sm:px-4 sm:pt-3"
+        >
+          <span
+            className="h-9 w-1 shrink-0 rounded-full transition-colors duration-500"
+            style={{
+              background: activeSpot?.color || "#2dd4bf",
+              boxShadow: `0 0 14px ${activeSpot?.glow || "rgba(45,212,191,0.5)"}`,
+            }}
+          />
+          <div className="min-w-0 flex-1">
+            <div className="truncate font-hud text-[10px] tracking-[0.2em] text-slate-400">
+              {activeSpot?.code || "SPX"} · {es ? "AMBIENTE ACTIVO" : "ACTIVE ENVIRONMENT"}
             </div>
+            <div className="truncate text-sm font-bold text-white">
+              {active?.label || (es ? "Cargando..." : "Loading...")}
+            </div>
+          </div>
+          {active && (
             <div className="shrink-0 text-right font-hud">
               <div
                 className={`text-lg font-bold leading-none ${
@@ -1399,225 +1507,248 @@ export function CommandViewport({
                 {fmt(active.pressure_atm)} atm
               </div>
             </div>
-          </div>
-        )}
-
-        {/* Pestañas */}
-        <div
-          role="tablist"
-          aria-label={es ? "Panel de misión" : "Mission panel"}
-          className="mx-3 grid grid-cols-2 gap-1 rounded-lg border border-slate-800 bg-slate-900/80 p-1"
-        >
-          {(
-            [
-              { id: "env", label: es ? "Ambientes" : "Environments", count: environments.length },
-              { id: "findings", label: es ? "Hallazgos" : "Findings", count: findings.length },
-            ] as const
-          ).map((tabItem) => (
-            <button
-              key={tabItem.id}
-              type="button"
-              role="tab"
-              aria-selected={panelTab === tabItem.id}
-              onClick={() => setPanelTab(tabItem.id)}
-              className={`flex h-7 cursor-pointer items-center justify-center gap-1.5 rounded-md font-hud text-[11px] font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300 ${
-                panelTab === tabItem.id
-                  ? "bg-teal-500/20 text-teal-200"
-                  : "text-slate-400 hover:text-white"
-              }`}
-            >
-              {tabItem.label}
-              <span
-                className={`rounded-full px-1.5 text-[10px] ${
-                  panelTab === tabItem.id ? "bg-teal-400/20" : "bg-slate-800"
-                }`}
-              >
-                {tabItem.id === "findings" && loadingFindings ? "…" : tabItem.count}
-              </span>
-            </button>
-          ))}
+          )}
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              setSheetOpen((v) => !v);
+            }}
+            aria-expanded={sheetOpen}
+            aria-label={
+              sheetOpen
+                ? es ? "Plegar panel" : "Collapse panel"
+                : es ? "Desplegar panel" : "Expand panel"
+            }
+            className="shrink-0 cursor-pointer rounded-lg border border-slate-700 bg-slate-900 p-1.5 text-slate-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300 sm:hidden"
+          >
+            {sheetOpen ? (
+              <ChevronDown className="h-4 w-4" />
+            ) : (
+              <ChevronUp className="h-4 w-4" />
+            )}
+          </button>
         </div>
 
-        {/* ---------- Pestaña: ambientes ---------- */}
-        {panelTab === "env" && (
-          <div role="tabpanel" className="p-3">
-            <div className="space-y-1">
-              {spots.map(({ env, spot }) => {
-                const isSelected = env.key === activeEnvKey;
-                const enriched = env.o2_fraction >= 0.3;
-                const o2 = Math.round(env.o2_fraction * 100);
-                return (
-                  <button
-                    key={env.key}
-                    type="button"
-                    onClick={() => selectEnv(env.key)}
-                    aria-pressed={isSelected}
-                    className={`group flex w-full cursor-pointer items-center gap-2.5 rounded-lg border px-2.5 py-2 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300 ${
-                      isSelected
-                        ? "border-teal-400/50 bg-teal-500/10"
-                        : "border-transparent hover:border-slate-700 hover:bg-slate-900/90"
-                    }`}
-                  >
-                    <span
-                      className="h-2 w-2 shrink-0 rounded-full"
-                      style={{ background: spot.color, boxShadow: `0 0 8px ${spot.glow}` }}
-                    />
-                    <div className="min-w-0 flex-1">
-                      <div className="flex items-baseline gap-2">
-                        <span className="shrink-0 font-hud text-[10px] text-slate-400">
-                          {spot.code}
-                        </span>
-                        <span
-                          className={`truncate text-xs font-medium ${
-                            isSelected ? "text-white" : "text-slate-200"
-                          }`}
-                        >
-                          {env.label}
-                        </span>
-                      </div>
-                      {/* Barra de oxígeno: el dato que más mueve el riesgo */}
-                      <div className="mt-1 h-1 overflow-hidden rounded-full bg-slate-800">
-                        <div
-                          className={`h-full ${enriched ? "bg-amber-400" : "bg-teal-400"}`}
-                          style={{ width: `${o2}%` }}
-                        />
-                      </div>
-                    </div>
-                    <div className="shrink-0 text-right font-hud text-[11px]">
-                      <div className={enriched ? "font-semibold text-amber-300" : "text-slate-200"}>
-                        {o2}% O₂
-                      </div>
-                      <div className="text-[10px] text-slate-400">
-                        {env.gravity_g === 0 ? "µg" : `${env.gravity_g} g`} ·{" "}
-                        {fmt(env.pressure_atm)} atm
-                      </div>
-                    </div>
-                    <ArrowRight
-                      className={`h-3.5 w-3.5 shrink-0 transition-transform group-hover:translate-x-0.5 ${
-                        isSelected ? "text-teal-300" : "text-slate-500"
-                      }`}
-                    />
-                  </button>
-                );
-              })}
-            </div>
-
-            {active && active.o2_fraction >= 0.3 && (
-              <div className="mt-2.5 flex items-start gap-2 rounded-lg border border-amber-500/25 bg-amber-950/20 px-2.5 py-2 text-[11px] text-amber-200">
-                <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-400" />
-                <span>
-                  {es
-                    ? `${active.label}: ${Math.round(active.o2_fraction * 100)}% de O₂ a ${fmt(active.pressure_atm)} atm (${atmToPsi(active.pressure_atm)} psi) eleva mucho el riesgo de ignición.`
-                    : `${active.label}: ${Math.round(active.o2_fraction * 100)}% O₂ at ${fmt(active.pressure_atm)} atm (${atmToPsi(active.pressure_atm)} psi) sharply increases ignition risk.`}
+        {/* Cuerpo: plegable en teléfonos, siempre visible desde tablet */}
+        <div className={`${sheetOpen ? "block" : "hidden"} sm:block`}>
+          {/* Pestañas */}
+          <div
+            role="tablist"
+            aria-label={es ? "Panel de misión" : "Mission panel"}
+            className="mx-3 grid grid-cols-2 gap-1 rounded-lg border border-slate-800 bg-slate-900/80 p-1"
+          >
+            {(
+              [
+                { id: "env", label: es ? "Ambientes" : "Environments", count: environments.length },
+                { id: "findings", label: es ? "Hallazgos" : "Findings", count: findings.length },
+              ] as const
+            ).map((tabItem) => (
+              <button
+                key={tabItem.id}
+                type="button"
+                role="tab"
+                aria-selected={panelTab === tabItem.id}
+                onClick={() => setPanelTab(tabItem.id)}
+                className={`flex h-8 cursor-pointer items-center justify-center gap-1.5 rounded-md font-hud text-[11px] font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300 sm:h-7 ${
+                  panelTab === tabItem.id
+                    ? "bg-teal-500/20 text-teal-200"
+                    : "text-slate-400 hover:text-white"
+                }`}
+              >
+                {tabItem.label}
+                <span
+                  className={`rounded-full px-1.5 text-[10px] ${
+                    panelTab === tabItem.id ? "bg-teal-400/20" : "bg-slate-800"
+                  }`}
+                >
+                  {tabItem.id === "findings" && loadingFindings ? "…" : tabItem.count}
                 </span>
-              </div>
-            )}
+              </button>
+            ))}
           </div>
-        )}
 
-        {/* ---------- Pestaña: hallazgos del ambiente activo ---------- */}
-        {panelTab === "findings" && (
-          <div role="tabpanel" className="p-3">
-            {/* Cambio rápido de ambiente sin salir de la pestaña */}
-            <div className="-mx-3 mb-2 flex gap-1 overflow-x-auto px-3 pb-1">
-              {spots.map(({ env, spot }) => {
-                const isSelected = env.key === activeEnvKey;
-                return (
-                  <button
-                    key={env.key}
-                    type="button"
-                    onClick={() => selectEnv(env.key)}
-                    aria-pressed={isSelected}
-                    className={`inline-flex shrink-0 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-full border px-2 py-0.5 font-hud text-[10px] transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300 ${
-                      isSelected
-                        ? "border-teal-400/60 bg-teal-500/15 text-teal-100"
-                        : "border-slate-800 bg-slate-900 text-slate-400 hover:text-white"
-                    }`}
-                  >
-                    <span
-                      className="h-1.5 w-1.5 rounded-full"
-                      style={{ background: spot.color }}
-                    />
-                    {env.label}
-                  </button>
-                );
-              })}
-            </div>
-
-            {loadingFindings ? (
-              <div className="flex items-center justify-center gap-2 py-10 font-hud text-xs text-teal-300">
-                <Loader2 className="h-4 w-4 animate-spin" />
-                {es ? "Cargando hallazgos..." : "Loading findings..."}
-              </div>
-            ) : findings.length === 0 ? (
-              <p className="py-10 text-center text-xs text-slate-400">
-                {es
-                  ? "Este ambiente no tiene hallazgos."
-                  : "This environment has no findings."}
-              </p>
-            ) : (
-              <div className="max-h-64 space-y-1 overflow-y-auto pr-1">
-                {findings.map((f, idx) => {
-                  const picked = pickedKey === f.key;
+          {/* ---------- Pestaña: ambientes ---------- */}
+          {panelTab === "env" && (
+            <div role="tabpanel" className="p-3">
+              <div className="max-h-[34vh] touch-pan-y space-y-1 overflow-y-auto overscroll-contain sm:max-h-none">
+                {spots.map(({ env, spot }) => {
+                  const isSelected = env.key === activeEnvKey;
+                  const enriched = env.o2_fraction >= 0.3;
+                  const o2 = Math.round(env.o2_fraction * 100);
                   return (
                     <button
-                      key={f.key}
+                      key={env.key}
                       type="button"
-                      onClick={() => pickFinding(f)}
-                      aria-pressed={picked}
-                      title={es ? "Explicar con Flamey" : "Explain with Flamey"}
-                      className={`group flex w-full cursor-pointer items-center gap-2.5 rounded-lg border px-2.5 py-1.5 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300 ${
-                        picked
+                      onClick={() => selectEnv(env.key)}
+                      aria-pressed={isSelected}
+                      className={`group flex w-full cursor-pointer items-center gap-2.5 rounded-lg border px-2.5 py-2 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300 ${
+                        isSelected
                           ? "border-teal-400/50 bg-teal-500/10"
                           : "border-transparent hover:border-slate-700 hover:bg-slate-900/90"
                       }`}
                     >
-                      <span className="w-5 shrink-0 text-center font-hud text-[10px] text-slate-400">
-                        {String(idx + 1).padStart(2, "0")}
-                      </span>
+                      <span
+                        className="h-2 w-2 shrink-0 rounded-full"
+                        style={{ background: spot.color, boxShadow: `0 0 8px ${spot.glow}` }}
+                      />
                       <div className="min-w-0 flex-1">
-                        <div className="truncate text-xs font-semibold text-white">
-                          {f.experiment}
+                        <div className="flex items-baseline gap-2">
+                          <span className="shrink-0 font-hud text-[10px] text-slate-400">
+                            {spot.code}
+                          </span>
+                          <span
+                            className={`truncate text-xs font-medium ${
+                              isSelected ? "text-white" : "text-slate-200"
+                            }`}
+                          >
+                            {env.label}
+                          </span>
                         </div>
-                        <div className="truncate text-[10px] text-slate-400">
-                          {f.material || (es ? "Sin material" : "No material")} · {f.flame_mode}
-                        </div>
+                        {/* Barra de oxígeno: el dato que más mueve el riesgo */}
                         <div className="mt-1 h-1 overflow-hidden rounded-full bg-slate-800">
                           <div
-                            className="h-full bg-teal-400"
-                            style={{ width: `${clamp(f.rpi, 0, 100)}%` }}
+                            className={`h-full ${enriched ? "bg-amber-400" : "bg-teal-400"}`}
+                            style={{ width: `${o2}%` }}
                           />
                         </div>
                       </div>
-                      <div className="shrink-0 text-right font-hud">
-                        <div className="text-sm font-bold leading-none text-teal-300">{f.rpi}</div>
-                        <div className="mt-0.5 text-[9px] uppercase text-slate-400">{f.band}</div>
+                      <div className="shrink-0 text-right font-hud text-[11px]">
+                        <div className={enriched ? "font-semibold text-amber-300" : "text-slate-200"}>
+                          {o2}% O₂
+                        </div>
+                        <div className="text-[10px] text-slate-400">
+                          {env.gravity_g === 0 ? "µg" : `${env.gravity_g} g`} ·{" "}
+                          {fmt(env.pressure_atm)} atm
+                        </div>
                       </div>
-                      <Sparkles
-                        className={`h-3.5 w-3.5 shrink-0 transition ${
-                          picked ? "text-teal-300" : "text-slate-600 group-hover:text-teal-300"
+                      <ArrowRight
+                        className={`h-3.5 w-3.5 shrink-0 transition-transform group-hover:translate-x-0.5 ${
+                          isSelected ? "text-teal-300" : "text-slate-500"
                         }`}
                       />
                     </button>
                   );
                 })}
               </div>
-            )}
 
-            <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-slate-800 pt-2.5">
-              <span className="text-[11px] text-slate-400">
-                {es ? "Toca uno y Flamey lo explica." : "Tap one and Flamey explains it."}
-              </span>
-              <Link
-                href="/ranking"
-                className="inline-flex shrink-0 items-center gap-1 font-hud text-[11px] text-teal-300 hover:text-teal-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300"
-              >
-                {es ? "Ranking completo" : "Full ranking"}
-                <ArrowRight className="h-3 w-3" />
-              </Link>
+              {active && active.o2_fraction >= 0.3 && (
+                <div className="mt-2.5 flex items-start gap-2 rounded-lg border border-amber-500/25 bg-amber-950/20 px-2.5 py-2 text-[11px] text-amber-200">
+                  <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-400" />
+                  <span>
+                    {es
+                      ? `${active.label}: ${Math.round(active.o2_fraction * 100)}% de O₂ a ${fmt(active.pressure_atm)} atm (${atmToPsi(active.pressure_atm)} psi) eleva mucho el riesgo de ignición.`
+                      : `${active.label}: ${Math.round(active.o2_fraction * 100)}% O₂ at ${fmt(active.pressure_atm)} atm (${atmToPsi(active.pressure_atm)} psi) sharply increases ignition risk.`}
+                  </span>
+                </div>
+              )}
             </div>
-          </div>
-        )}
+          )}
+
+          {/* ---------- Pestaña: hallazgos del ambiente activo ---------- */}
+          {panelTab === "findings" && (
+            <div role="tabpanel" className="p-3">
+              {/* Cambio rápido de ambiente sin salir de la pestaña */}
+              <div className="-mx-3 mb-2 flex touch-pan-x gap-1 overflow-x-auto overscroll-contain px-3 pb-1">
+                {spots.map(({ env, spot }) => {
+                  const isSelected = env.key === activeEnvKey;
+                  return (
+                    <button
+                      key={env.key}
+                      type="button"
+                      onClick={() => selectEnv(env.key)}
+                      aria-pressed={isSelected}
+                      className={`inline-flex shrink-0 cursor-pointer items-center gap-1.5 whitespace-nowrap rounded-full border px-2.5 py-1 font-hud text-[10px] transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300 sm:px-2 sm:py-0.5 ${
+                        isSelected
+                          ? "border-teal-400/60 bg-teal-500/15 text-teal-100"
+                          : "border-slate-800 bg-slate-900 text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      <span
+                        className="h-1.5 w-1.5 rounded-full"
+                        style={{ background: spot.color }}
+                      />
+                      {env.label}
+                    </button>
+                  );
+                })}
+              </div>
+
+              {loadingFindings ? (
+                <div className="flex items-center justify-center gap-2 py-8 font-hud text-xs text-teal-300">
+                  <Loader2 className="h-4 w-4 animate-spin" />
+                  {es ? "Cargando hallazgos..." : "Loading findings..."}
+                </div>
+              ) : findings.length === 0 ? (
+                <p className="py-8 text-center text-xs text-slate-400">
+                  {es
+                    ? "Este ambiente no tiene hallazgos."
+                    : "This environment has no findings."}
+                </p>
+              ) : (
+                <div className="max-h-[26vh] touch-pan-y space-y-1 overflow-y-auto overscroll-contain pr-1 sm:max-h-64">
+                  {findings.map((f, idx) => {
+                    const picked = pickedKey === f.key;
+                    return (
+                      <button
+                        key={f.key}
+                        type="button"
+                        onClick={() => pickFinding(f)}
+                        aria-pressed={picked}
+                        title={es ? "Explicar con Flamey" : "Explain with Flamey"}
+                        className={`group flex w-full cursor-pointer items-center gap-2.5 rounded-lg border px-2.5 py-2 text-left transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300 sm:py-1.5 ${
+                          picked
+                            ? "border-teal-400/50 bg-teal-500/10"
+                            : "border-transparent hover:border-slate-700 hover:bg-slate-900/90"
+                        }`}
+                      >
+                        <span className="w-5 shrink-0 text-center font-hud text-[10px] text-slate-400">
+                          {String(idx + 1).padStart(2, "0")}
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate text-xs font-semibold text-white">
+                            {f.experiment}
+                          </div>
+                          <div className="truncate text-[10px] text-slate-400">
+                            {f.material || (es ? "Sin material" : "No material")} · {f.flame_mode}
+                          </div>
+                          <div className="mt-1 h-1 overflow-hidden rounded-full bg-slate-800">
+                            <div
+                              className="h-full bg-teal-400"
+                              style={{ width: `${clamp(f.rpi, 0, 100)}%` }}
+                            />
+                          </div>
+                        </div>
+                        <div className="shrink-0 text-right font-hud">
+                          <div className="text-sm font-bold leading-none text-teal-300">{f.rpi}</div>
+                          <div className="mt-0.5 text-[9px] uppercase text-slate-400">{f.band}</div>
+                        </div>
+                        <Sparkles
+                          className={`h-3.5 w-3.5 shrink-0 transition ${
+                            picked ? "text-teal-300" : "text-slate-600 group-hover:text-teal-300"
+                          }`}
+                        />
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+
+              <div className="mt-2.5 flex items-center justify-between gap-2 border-t border-slate-800 pt-2.5">
+                <span className="text-[11px] text-slate-400">
+                  {es ? "Toca uno y Flamey lo explica." : "Tap one and Flamey explains it."}
+                </span>
+                <Link
+                  href="/ranking"
+                  className="inline-flex shrink-0 items-center gap-1 font-hud text-[11px] text-teal-300 hover:text-teal-200 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300"
+                >
+                  {es ? "Ranking completo" : "Full ranking"}
+                  <ArrowRight className="h-3 w-3" />
+                </Link>
+              </div>
+            </div>
+          )}
+        </div>
       </div>
     </div>
   );

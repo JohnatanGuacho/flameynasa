@@ -184,6 +184,12 @@ function navRightEdge(): number {
   return nav ? nav.getBoundingClientRect().right : 0;
 }
 
+/*
+ * En teléfonos los campos usan letra de 16 px: con menos, iOS hace zoom
+ * automático al enfocar y descuadra la página. Desde tablet vuelven a 12 px.
+ */
+const FIELD_TEXT = "text-base sm:text-xs";
+
 /* ------------------------------------------------------------------ */
 /*  Datos de materiales y entornos                                     */
 /* ------------------------------------------------------------------ */
@@ -732,7 +738,7 @@ function Answer({ text }: { text: string }) {
   );
 }
 
-/* Botón de icono pequeño, reutilizado en cabecera y pie */
+/* Botón de icono: más grande en teléfonos para que el dedo acierte. */
 function IconBtn(props: {
   label: string;
   active?: boolean;
@@ -750,7 +756,7 @@ function IconBtn(props: {
       aria-pressed={active}
       disabled={disabled}
       onClick={onClick}
-      className={`inline-flex h-7 min-w-7 cursor-pointer items-center justify-center gap-1 rounded-lg border px-1.5 font-hud text-[11px] transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 disabled:opacity-40 ${
+      className={`inline-flex h-8 min-w-8 cursor-pointer items-center justify-center gap-1 rounded-lg border px-1.5 font-hud text-[11px] transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 disabled:opacity-40 sm:h-7 sm:min-w-7 ${
         active ? t.iconBtnActive : t.iconBtn
       }`}
     >
@@ -911,11 +917,14 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
   const onDragStart = (e: React.PointerEvent<HTMLElement>) => {
     if (e.button !== 0 || !rootRef.current) return;
     const rect = rootRef.current.getBoundingClientRect();
+    const minDx = navRightEdge() + EDGE_GAP_PX - rect.left;
+    const maxDx = window.innerWidth - EDGE_GAP_PX - rect.right;
     dragRef.current = {
       startX: e.clientX,
       // Límites: no pasar sobre el menú lateral ni salirse de la ventana.
-      minDx: navRightEdge() + EDGE_GAP_PX - rect.left,
-      maxDx: window.innerWidth - EDGE_GAP_PX - rect.right,
+      // Si el panel ya ocupa casi todo el ancho (teléfono), no hay recorrido.
+      minDx: Math.min(minDx, 0),
+      maxDx: Math.max(maxDx, 0),
       moved: false,
     };
     e.currentTarget.setPointerCapture(e.pointerId);
@@ -960,8 +969,8 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
   // --sidebar-w lo publica AppShell: así Flamey nunca queda sobre el menú.
   const positionStyle: React.CSSProperties = {
     ...(side === "left"
-      ? { left: "calc(var(--sidebar-w, 0px) + 1rem)" }
-      : { right: "1.25rem" }),
+      ? { left: "calc(var(--sidebar-w, 0px) + 0.75rem)" }
+      : { right: "0.75rem" }),
     transform: dragX ? `translateX(${dragX}px)` : undefined,
   };
 
@@ -1329,7 +1338,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
         style={positionStyle}
         title="Abrir Flamey. Arrastra para moverlo de lado."
         aria-label="Abrir asistente Flamey"
-        className={`fixed bottom-5 z-30 flex cursor-pointer touch-none select-none items-center gap-2 rounded-full border px-3.5 py-2 shadow-2xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${t.pill}`}
+        className={`fixed bottom-3 z-30 flex cursor-pointer touch-none select-none items-center gap-2 rounded-full border px-3.5 py-2.5 shadow-2xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 sm:bottom-5 sm:py-2 ${t.pill}`}
       >
         <Flame className="h-4 w-4 text-orange-500" />
         <span className="font-hud text-xs font-bold tracking-wide">FLAMEY</span>
@@ -1360,13 +1369,14 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
 
   return (
     <ThemeCtx.Provider value={t}>
+      {/* El ancho se adapta: 320 px como máximo, o lo que deje libre el menú lateral. */}
       <aside
         ref={(el) => {
           rootRef.current = el;
         }}
         style={positionStyle}
         aria-label="Asistente de seguridad contra incendios Flamey"
-        className={`fixed bottom-5 z-30 flex max-h-[70vh] w-[320px] flex-col overflow-hidden rounded-2xl border shadow-2xl backdrop-blur-xl ${t.panel}`}
+        className={`fixed bottom-3 z-30 flex max-h-[min(78dvh,640px)] w-[min(320px,calc(100vw-var(--sidebar-w,0px)-1.5rem))] flex-col overflow-hidden rounded-2xl border shadow-2xl backdrop-blur-xl sm:bottom-5 sm:max-h-[70vh] ${t.panel}`}
       >
         {/* CABECERA */}
         <div
@@ -1413,12 +1423,15 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
                 <Moon className="h-3.5 w-3.5" />
               )}
             </IconBtn>
-            <IconBtn
-              label={side === "left" ? "Mover a la derecha" : "Mover a la izquierda"}
-              onClick={() => saveSide(side === "left" ? "right" : "left")}
-            >
-              <ArrowLeftRight className="h-3.5 w-3.5" />
-            </IconBtn>
+            {/* En teléfonos el panel ya ocupa el ancho: cambiar de lado no aporta */}
+            <span className="hidden sm:inline-flex">
+              <IconBtn
+                label={side === "left" ? "Mover a la derecha" : "Mover a la izquierda"}
+                onClick={() => saveSide(side === "left" ? "right" : "left")}
+              >
+                <ArrowLeftRight className="h-3.5 w-3.5" />
+              </IconBtn>
+            </span>
             <IconBtn
               label="Elegir motor de respuestas"
               active={showSettings}
@@ -1449,7 +1462,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
                 id="flamey-model-select"
                 value={selectedModel}
                 onChange={(e) => setSelectedModel(e.target.value)}
-                className={`h-7 min-w-0 flex-1 cursor-pointer rounded-lg border px-2 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${t.modelSelect}`}
+                className={`h-9 min-w-0 flex-1 cursor-pointer rounded-lg border px-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 sm:h-7 ${FIELD_TEXT} ${t.modelSelect}`}
               >
                 <option value={RAG_MODE}>{modelLabel(RAG_MODE)}</option>
                 {models.map((m) => (
@@ -1497,7 +1510,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
                 cancelStream();
                 setTab(id);
               }}
-              className={`flex h-8 cursor-pointer items-center justify-center gap-1.5 border-b-2 font-hud text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-teal-400 ${
+              className={`flex h-10 cursor-pointer items-center justify-center gap-1.5 border-b-2 font-hud text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-teal-400 sm:h-8 ${
                 tab === id ? t.tabOn : t.tabOff
               }`}
             >
@@ -1508,7 +1521,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
         </div>
 
         {/* CUERPO */}
-        <div className="min-h-0 flex-1 overflow-y-auto p-3">
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-3">
           {/* ============ CHAT ============ */}
           {tab === "finding" && (
             <div role="tabpanel" className="space-y-2">
@@ -1553,7 +1566,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
                     <button
                       type="button"
                       onClick={explainCurrent}
-                      className="flex h-9 w-full cursor-pointer items-center justify-center gap-1.5 rounded-xl bg-teal-500 text-xs font-semibold text-slate-950 hover:bg-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300"
+                      className="flex h-10 w-full cursor-pointer items-center justify-center gap-1.5 rounded-xl bg-teal-500 text-xs font-semibold text-slate-950 hover:bg-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300 sm:h-9"
                     >
                       <Sparkles className="h-3.5 w-3.5" />
                       Explicar este experimento
@@ -1562,7 +1575,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
                     <div
                       ref={listRef}
                       aria-live="polite"
-                      className="max-h-56 space-y-1.5 overflow-y-auto"
+                      className="max-h-[30dvh] space-y-1.5 overflow-y-auto overscroll-contain sm:max-h-56"
                     >
                       {messages.map((m, i) =>
                         m.role === "user" ? (
@@ -1606,14 +1619,14 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
 
                   {/* Preguntas sugeridas: solo las que faltan por hacer */}
                   {quickChips.length > 0 && (
-                    <div className="-mx-3 flex gap-1.5 overflow-x-auto px-3 pb-0.5">
+                    <div className="-mx-3 flex gap-1.5 overflow-x-auto overscroll-contain px-3 pb-0.5">
                       {quickChips.map((chip) => (
                         <button
                           key={chip.id}
                           type="button"
                           disabled={streaming}
                           onClick={() => submitQuestion(chip.chip)}
-                          className={`shrink-0 cursor-pointer whitespace-nowrap rounded-full border px-2.5 py-1 text-[11px] disabled:opacity-40 ${t.chip}`}
+                          className={`shrink-0 cursor-pointer whitespace-nowrap rounded-full border px-3 py-1.5 text-xs disabled:opacity-40 sm:px-2.5 sm:py-1 sm:text-[11px] ${t.chip}`}
                         >
                           {chip.chip}
                         </button>
@@ -1628,18 +1641,20 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
                     <input
                       id="flamey-ask-input"
                       type="text"
+                      enterKeyHint="send"
+                      autoComplete="off"
                       value={question}
                       onChange={(e) => setQuestion(e.target.value)}
                       placeholder="Pregunta algo..."
-                      className={`h-8 min-w-0 flex-1 rounded-lg border px-2.5 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${t.field}`}
+                      className={`h-10 min-w-0 flex-1 rounded-lg border px-2.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 sm:h-8 ${FIELD_TEXT} ${t.field}`}
                     />
                     <button
                       type="submit"
                       disabled={streaming || !question.trim()}
                       aria-label="Enviar pregunta"
-                      className="h-8 cursor-pointer rounded-lg bg-teal-500 px-2.5 text-slate-950 hover:bg-teal-400 disabled:opacity-40"
+                      className="h-10 cursor-pointer rounded-lg bg-teal-500 px-3 text-slate-950 hover:bg-teal-400 disabled:opacity-40 sm:h-8 sm:px-2.5"
                     >
-                      <Send className="h-3.5 w-3.5" />
+                      <Send className="h-4 w-4 sm:h-3.5 sm:w-3.5" />
                     </button>
                   </form>
 
@@ -1696,7 +1711,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
                       <button
                         type="button"
                         onClick={() => setRuleIdx((i) => i + 1)}
-                        className={`cursor-pointer font-hud text-[11px] ${t.link}`}
+                        className={`cursor-pointer py-1 font-hud text-[11px] ${t.link}`}
                       >
                         Ver otro
                       </button>
@@ -1727,7 +1742,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
                           setSimPsi(env.psi);
                           setSimGravity(env.g);
                         }}
-                        className={`h-7 cursor-pointer rounded-lg border font-hud text-[11px] transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${
+                        className={`h-9 cursor-pointer rounded-lg border font-hud text-[11px] transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 sm:h-7 ${
                           active ? t.envOn : t.envOff
                         }`}
                       >
@@ -1748,7 +1763,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
               {/* Ajuste fino */}
               {showAdvanced && (
                 <div
-                  className={`space-y-2 rounded-lg border p-2 font-hud text-[11px] ${t.surface} ${t.soft}`}
+                  className={`space-y-3 rounded-lg border p-2 font-hud text-[11px] sm:space-y-2 ${t.surface} ${t.soft}`}
                 >
                   <label htmlFor="sim-o2-slider" className="flex items-center gap-2">
                     <span className="w-14 shrink-0">Oxígeno</span>
@@ -1762,7 +1777,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
                         setSimO2(Number(e.target.value));
                         setSimEnvName("Mezcla personalizada");
                       }}
-                      className="h-1.5 min-w-0 flex-1 cursor-pointer accent-teal-500"
+                      className="h-5 min-w-0 flex-1 cursor-pointer accent-teal-500 sm:h-1.5"
                     />
                     <span
                       className={`w-12 shrink-0 text-right font-bold ${
@@ -1786,7 +1801,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
                         setSimPsi(Number(e.target.value));
                         setSimEnvName("Mezcla personalizada");
                       }}
-                      className="h-1.5 min-w-0 flex-1 cursor-pointer accent-cyan-500"
+                      className="h-5 min-w-0 flex-1 cursor-pointer accent-cyan-500 sm:h-1.5"
                     />
                     <span className={`w-12 shrink-0 text-right ${t.info}`}>
                       {fmt(toAtm(simPsi))} atm
@@ -1802,7 +1817,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
                         setSimGravity(Number(e.target.value));
                         setSimEnvName("Mezcla personalizada");
                       }}
-                      className={`h-7 min-w-0 flex-1 cursor-pointer rounded-lg border px-1.5 ${t.select}`}
+                      className={`h-9 min-w-0 flex-1 cursor-pointer rounded-lg border px-1.5 text-base sm:h-7 sm:text-[11px] ${t.select}`}
                     >
                       <option value={0}>0 g (ISS / EVA)</option>
                       <option value={0.165}>0,165 g (Luna)</option>
@@ -1825,7 +1840,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
                     setSelectedPresetId(e.target.value);
                     setCustomMaterial("");
                   }}
-                  className={`h-8 min-w-0 flex-1 cursor-pointer rounded-lg border px-2 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${t.field} ${
+                  className={`h-10 min-w-0 flex-1 cursor-pointer rounded-lg border px-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 sm:h-8 ${FIELD_TEXT} ${t.field} ${
                     isCustomMaterial ? "opacity-50" : ""
                   }`}
                 >
@@ -1841,10 +1856,11 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
                 <input
                   id="sim-custom-material"
                   type="text"
+                  autoComplete="off"
                   value={customMaterial}
                   onChange={(e) => setCustomMaterial(e.target.value)}
                   placeholder="Otro: Velcro..."
-                  className={`h-8 min-w-0 flex-1 rounded-lg border px-2.5 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${t.field}`}
+                  className={`h-10 min-w-0 flex-1 rounded-lg border px-2.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 sm:h-8 ${FIELD_TEXT} ${t.field}`}
                 />
               </div>
 
@@ -1900,7 +1916,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
 
                 {showWhy && (
                   <div className={`border-t px-2.5 pb-2.5 pt-2 ${t.whyDivider}`}>
-                    <div className="max-h-40 overflow-y-auto">
+                    <div className="max-h-40 overflow-y-auto overscroll-contain">
                       <Answer text={simText} />
                     </div>
                     {voiceAvailable && (
