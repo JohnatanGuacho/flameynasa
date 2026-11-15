@@ -4,6 +4,9 @@ const OLLAMA_URL = (
   process.env.NEXT_PUBLIC_OLLAMA_URL || "http://localhost:11434"
 ).replace(/\/$/, "");
 
+const REFUSAL_PATTERN =
+  /^(lo siento|disculpa|no puedo proporcionar|no puedo ayudar|como modelo|i'?m sorry|i cannot)/i;
+
 export async function getOllamaModels(): Promise<string[]> {
   try {
     const res = await fetch(`${OLLAMA_URL}/api/tags`, { cache: "no-store" });
@@ -44,7 +47,7 @@ export async function warmupOllamaModel(
         prompt: "",
         stream: false,
         keep_alive: "15m",
-        options: { num_ctx: 1536 },
+        options: { num_ctx: 1024 },
       }),
     });
     return res.ok;
@@ -61,32 +64,34 @@ export async function askOllamaStream(params: {
   signal?: AbortSignal;
 }): Promise<void> {
   const { model, context, userQuestion, onToken, signal } = params;
-  const { finding, environment, evidence } = context;
+  const { finding, environment } = context;
 
-  const evidenceSummary = evidence
+  const topFactors = (finding.factors || [])
     .slice(0, 2)
-    .map(
-      (e) =>
-        `- ${e.file} (fila #${e.row}, calidad ${Math.round(e.quality * 100)}%): ${JSON.stringify(e.raw)}`
-    )
-    .join("\n");
+    .map((f) => `${f.name} (+${f.contribution.toFixed(1)})`)
+    .join(", ");
 
-  const systemPrompt = `Eres FLAMEY, especialista de la NASA en seguridad contra incendios espaciales (base PSI).
-Tu objetivo es advertir de forma clara y sencilla cómo funciona el fenómeno de combustión y cuál es el peligro real de usar ese material o combustible en el entorno seleccionado (Luna, Marte, Rover, Traje EVA o ISS), aportando conocimiento de física en baja gravedad (sin convección natural, llamas esféricas por difusión, mayor inflamabilidad con O2 enriquecido).
-Reglas:
-- Nunca inventes datos ni cifras fuera del contexto.
-- No uses títulos grandes (# o ###). Usa etiquetas en negrita y frases completas.
-- Estructura siempre en 3 puntos claros y completos (máximo 150 palabras en total):
-  **1. Qué ocurre:** explicación física sencilla del experimento.
-  **2. Peligro en este entorno:** riesgo real del material/atmósfera para la tripulación.
-  **3. Control y prevención:** medida concreta de seguridad (materiales, límite de O2, detección o supresión).`;
+  const systemPrompt = `Eres FLAMEY, asistente educativo de la NASA para prevención de incendios en naves y hábitats espaciales (base científica PSI).
+Resume los datos experimentales provistos en español de forma clara, objetiva y breve (máximo 65 palabras, sin títulos #):
+- **Ensayo PSI:** resume los parámetros medidos y la condición del módulo actual.
+- **Evaluación técnica:** explica si el material o fluido es apto o requiere restricción en esta atmósfera y gravedad.
+- **Prevención:** indica qué material ignífugo (Nomex, PBI) o control ambiental (dilución con N2/CO2/He) protege a la tripulación.`;
 
-  const dataPrompt = `Entorno: ${environment.label} (${environment.gravity_g === 0 ? "microgravedad 0g" : environment.gravity_g + " g"}, ${Math.round(environment.o2_fraction * 100)}% O2, ${atmToPsi(environment.pressure_atm)} psi).
-Experimento: ${finding.experiment} (${finding.facility}) | Material: ${finding.material || "N/A"} | Modo: ${finding.flame_mode} | RPI: ${finding.rpi} (${finding.band}).
-Resumen técnico: ${finding.narrative}
-Evidencia CSV:
-${evidenceSummary}
-${userQuestion ? `Pregunta del usuario: ${userQuestion}` : "Explica este hallazgo y advierte los riesgos de este material en este entorno."}`;
+  const dataPrompt = `Módulo espacial: ${environment.label} (${
+    environment.gravity_g === 0 ? "microgravedad 0g" : `${environment.gravity_g}g`
+  }, ${Math.round(environment.o2_fraction * 100)}% O2, ${atmToPsi(
+    environment.pressure_atm
+  )} psi, diluyente ${environment.diluent}).
+Experimento NASA: ${finding.experiment} (${finding.facility}) | Muestra: ${
+    finding.material || "muestra experimental"
+  } | Flujo: ${finding.flame_mode} | Índice RPI: ${finding.rpi} (${finding.band}).
+Variables clave: ${topFactors || "N/A"}.
+Registro técnico: ${finding.narrative}
+${
+  userQuestion
+    ? `Consulta de ingeniería: ${userQuestion}`
+    : "Sintetiza el hallazgo científico y la medida de seguridad recomendada."
+}`;
 
   const res = await fetch(`${OLLAMA_URL}/api/chat`, {
     method: "POST",
@@ -97,9 +102,9 @@ ${userQuestion ? `Pregunta del usuario: ${userQuestion}` : "Explica este hallazg
       stream: true,
       keep_alive: "15m",
       options: {
-        temperature: 0.25,
-        num_ctx: 1536,
-        num_predict: 550, // Suficiente para que nunca se corte a mitad de oración
+        temperature: 0.2,
+        num_ctx: 1024,
+        num_predict: 180,
       },
       messages: [
         { role: "system", content: systemPrompt },
@@ -115,6 +120,7 @@ ${userQuestion ? `Pregunta del usuario: ${userQuestion}` : "Explica este hallazg
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let accumulated = "";
+  let verifiedSafeStart = false;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -127,11 +133,33 @@ ${userQuestion ? `Pregunta del usuario: ${userQuestion}` : "Explica este hallazg
         const json = JSON.parse(line);
         if (json.message?.content) {
           accumulated += json.message.content;
-          onToken(accumulated);
+          const trimmed = accumulated.trimStart();
+
+          // Esperar los primeros 22 caracteres para verificar que no sea un falso rechazo
+          if (!verifiedSafeStart) {
+            if (REFUSAL_PATTERN.test(trimmed)) {
+              await reader.cancel();
+              throw new Error("REFUSAL_FALLBACK");
+            }
+            if (trimmed.length >= 22 || json.done) {
+              verifiedSafeStart = true;
+              onToken(accumulated);
+            }
+          } else {
+            onToken(accumulated);
+          }
         }
-      } catch {
+      } catch (err) {
+        if (err instanceof Error && err.message === "REFUSAL_FALLBACK") {
+          throw err;
+        }
         // Ignorar fragmentos parciales de línea JSON
       }
     }
+  }
+
+  // Si la respuesta completa fue muy corta (<22 chars) y válida, emitirla al final
+  if (!verifiedSafeStart && accumulated.trim()) {
+    onToken(accumulated);
   }
 }

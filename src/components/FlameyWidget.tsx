@@ -9,9 +9,9 @@ import {
   warmupOllamaModel,
 } from "@/lib/ollama";
 import {
-  createStreamSpeaker,
   isVoiceSupported,
-  speakText,
+  speakFindingAlert,
+  speakShortReply,
   stopVoice,
 } from "@/lib/voice";
 import {
@@ -35,9 +35,7 @@ interface Props {
 
 const RAG_MODE = "psi-rag";
 
-/** Renderiza negritas (**texto**), cursivas (*texto*) y listas sin mostrar asteriscos crudos */
 function renderInlineMarkdown(line: string): React.ReactNode[] {
-  // Limpiar asteriscos sueltos al final mientras el token aún está escribiéndose
   const normalized = line.replace(/\*{1,2}$/, "");
   const tokens = normalized.split(/(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)/g);
 
@@ -79,7 +77,6 @@ function MarkdownMessage({ content }: { content: string }) {
         const line = rawLine.trim();
         if (!line) return <div key={idx} className="h-1" />;
 
-        // Encabezados Markdown (### Título)
         const headingMatch = line.match(/^#{1,4}\s+(.*)$/);
         if (headingMatch) {
           return (
@@ -89,7 +86,6 @@ function MarkdownMessage({ content }: { content: string }) {
           );
         }
 
-        // Viñetas (- ítem o * ítem)
         const bulletMatch = line.match(/^[-*•]\s+(.*)$/);
         if (bulletMatch) {
           return (
@@ -125,13 +121,13 @@ function buildPsiRagReport(ctx: ContextOut, question?: string): string {
       q.includes("peligro") ||
       q.includes("usar")
     ) {
-      return `**Veredicto PSI (${environment.label}):** ${
+      return `- **Veredicto (${environment.label}):** ${
         isCritical
-          ? `ALTO RIESGO / RESTRINGIDO. A ${o2Pct}% O₂ (${psi} psi) la inflamabilidad de ${
+          ? `PELIGROSO / RESTRINGIDO a ${o2Pct}% O₂ (${psi} psi) para ${
               finding.material || "este material"
-            } supera el margen seguro probado (${finding.narrative}).`
-          : `RIESGO CONTROLADO bajo atmósfera estándar (${o2Pct}% O₂, ${psi} psi), sujeto a control de flujo.`
-      }\n**Factor dominante:** ${topFactor} con ${finding.observations} corridas experimentales.`;
+            }.`
+          : `RIESGO CONTROLADO a ${o2Pct}% O₂ (${psi} psi), sujeto a flujo nominal.`
+      }\n- **Factor clave:** ${topFactor} (${finding.observations} corridas PSI).`;
     }
     if (
       q.includes("apag") ||
@@ -139,27 +135,25 @@ function buildPsiRagReport(ctx: ContextOut, question?: string): string {
       q.includes("preven") ||
       q.includes("mitig")
     ) {
-      return `**Control recomendado:** Limitar exposición de ${
+      return `- **Acción:** Evitar ${
         finding.material || "combustibles"
-      } en atmósferas >30% O₂, aplicar dilución supresora con CO₂ o He (protocolo FLEX) y mantener evacuación por debajo de ${
+      } en >30% O₂, diluir con CO₂ o He y asegurar evacuación < ${
         environment.egress_s
       } s.`;
     }
   }
 
   return [
-    `**1. Dato PSI (${finding.facility}):** ${finding.narrative}`,
-    `**2. Riesgo en ${environment.label} (${o2Pct}% O₂ · ${psi} psi):** ${
+    `- **Dato PSI:** ${finding.narrative}`,
+    `- **Peligro en ${environment.label} (${o2Pct}% O₂):** ${
       isCritical
         ? `Atmósfera enriquecida crítica; ${
             finding.material || "el material"
-          } presenta ignición acelerada en ${
-            environment.gravity_g === 0 ? "microgravedad" : `${environment.gravity_g} g`
-          } (factor clave: ${topFactor}).`
-        : `Condición nominal de cabina (${topFactor}); vigilar acumulación local de oxígeno y flujo de ventilación.`
+          } acelera su ignición (${topFactor}).`
+        : `Condición nominal (${topFactor}); vigilar acumulación local de O₂.`
     }`,
-    `**3. Acción:** Sustituir por textiles ignífugos certificados (Nomex/PBI), aplicar supresión por dilución (CO₂/He) y auditar las ${evidence.length} filas CSV respaldadas.`,
-  ].join("\n\n");
+    `- **Acción:** Usar textiles ignífugos (Nomex/PBI) o dilución CO₂/He (${evidence.length} filas CSV).`,
+  ].join("\n");
 }
 
 export function FlameyWidget({ activeFinding, environmentKey }: Props) {
@@ -168,11 +162,9 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
   const [rules, setRules] = useState<RulesOut | null>(null);
   const [mode, setMode] = useState<"finding" | "rules" | "ask">("finding");
 
-  // Estado de voz (activable / desactivable)
   const [voiceEnabled, setVoiceEnabled] = useState(false);
   const [voiceAvailable, setVoiceAvailable] = useState(false);
 
-  // Modelos locales vs PSI-RAG
   const [models, setModels] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState<string>(RAG_MODE);
   const [scanning, setScanning] = useState(false);
@@ -186,15 +178,11 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
   const prevModelRef = useRef<string>(RAG_MODE);
   const warmupAbortRef = useRef<AbortController | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
-  const speakerRef = useRef<ReturnType<typeof createStreamSpeaker> | null>(null);
   const voiceEnabledRef = useRef(voiceEnabled);
 
   useEffect(() => {
     voiceEnabledRef.current = voiceEnabled;
-    if (!voiceEnabled) {
-      speakerRef.current?.cancel();
-      stopVoice();
-    }
+    if (!voiceEnabled) stopVoice();
   }, [voiceEnabled]);
 
   useEffect(() => {
@@ -205,10 +193,9 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
   const toggleVoice = () => {
     setVoiceEnabled((prev) => {
       const next = !prev;
-      if (next && aiExplanation && !streaming) {
-        speakText(aiExplanation);
+      if (next && context) {
+        speakFindingAlert(context);
       } else if (!next) {
-        speakerRef.current?.cancel();
         stopVoice();
       }
       return next;
@@ -239,11 +226,10 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
     api.rules().then(setRules).catch(() => {});
   }, [scanLocalModels]);
 
-  // Gestionar cambio entre PSI-RAG y modelos locales de GPU
+  // Cambiar entre PSI-RAG y modelos locales de GPU
   useEffect(() => {
     streamAbortRef.current?.abort();
     warmupAbortRef.current?.abort();
-    speakerRef.current?.cancel();
     stopVoice();
 
     if (selectedModel === RAG_MODE) {
@@ -286,14 +272,12 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
     return () => controller.abort();
   }, [selectedModel]);
 
-  // Ejecutar análisis + locución si la voz está activa
+  // Cargar análisis puntual y emitir alerta de voz resumida (1 sola vez, sin eco)
   useEffect(() => {
     if (!activeFinding) return;
     let cancelled = false;
 
-    speakerRef.current?.cancel();
     stopVoice();
-
     setOpen(true);
     setMode("finding");
     setAiExplanation("");
@@ -304,10 +288,12 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
         if (cancelled) return;
         setContext(ctx);
 
+        if (voiceEnabledRef.current) {
+          speakFindingAlert(ctx);
+        }
+
         if (selectedModel === RAG_MODE || !modelReady) {
-          const report = buildPsiRagReport(ctx);
-          setAiExplanation(report);
-          if (voiceEnabledRef.current) speakText(report);
+          setAiExplanation(buildPsiRagReport(ctx));
           return;
         }
 
@@ -315,33 +301,16 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
         const controller = new AbortController();
         streamAbortRef.current = controller;
 
-        const streamSpeaker = createStreamSpeaker();
-        speakerRef.current = streamSpeaker;
-        let latestText = "";
-
         setStreaming(true);
         askOllamaStream({
           model: selectedModel,
           context: ctx,
           signal: controller.signal,
-          onToken: (text) => {
-            latestText = text;
-            setAiExplanation(text);
-            if (voiceEnabledRef.current) {
-              streamSpeaker.pushAccumulated(text);
-            }
-          },
+          onToken: (text) => setAiExplanation(text),
         })
-          .then(() => {
-            if (!controller.signal.aborted && voiceEnabledRef.current) {
-              streamSpeaker.flush(latestText);
-            }
-          })
           .catch((err) => {
             if (err?.name !== "AbortError") {
-              const fallback = buildPsiRagReport(ctx);
-              setAiExplanation(fallback);
-              if (voiceEnabledRef.current) speakText(fallback);
+              setAiExplanation(buildPsiRagReport(ctx));
             }
           })
           .finally(() => {
@@ -353,7 +322,6 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
     return () => {
       cancelled = true;
       streamAbortRef.current?.abort();
-      speakerRef.current?.cancel();
     };
   }, [activeFinding, environmentKey, modelReady, selectedModel]);
 
@@ -361,9 +329,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
     e.preventDefault();
     if (!question.trim() || !context) return;
 
-    speakerRef.current?.cancel();
     stopVoice();
-
     const q = question;
     setQuestion("");
     setMode("finding");
@@ -371,7 +337,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
     if (selectedModel === RAG_MODE || !modelReady) {
       const answer = buildPsiRagReport(context, q);
       setAiExplanation(answer);
-      if (voiceEnabledRef.current) speakText(answer);
+      if (voiceEnabledRef.current) speakShortReply(answer);
       return;
     }
 
@@ -379,10 +345,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
     const controller = new AbortController();
     streamAbortRef.current = controller;
 
-    const streamSpeaker = createStreamSpeaker();
-    speakerRef.current = streamSpeaker;
-    let latestText = "";
-
+    let finalReply = "";
     setAiExplanation("");
     setStreaming(true);
 
@@ -393,20 +356,17 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
         userQuestion: q,
         signal: controller.signal,
         onToken: (text) => {
-          latestText = text;
+          finalReply = text;
           setAiExplanation(text);
-          if (voiceEnabledRef.current) {
-            streamSpeaker.pushAccumulated(text);
-          }
         },
       });
-      if (!controller.signal.aborted && voiceEnabledRef.current) {
-        streamSpeaker.flush(latestText);
+      if (!controller.signal.aborted && voiceEnabledRef.current && finalReply) {
+        speakShortReply(finalReply);
       }
     } catch {
       const fallback = buildPsiRagReport(context, q);
       setAiExplanation(fallback);
-      if (voiceEnabledRef.current) speakText(fallback);
+      if (voiceEnabledRef.current) speakShortReply(fallback);
     } finally {
       if (!controller.signal.aborted) setStreaming(false);
     }
@@ -429,7 +389,6 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
 
   return (
     <div className="fixed left-16 bottom-5 z-30 w-[360px] sm:w-[430px] rounded-2xl bg-slate-950/95 backdrop-blur-xl border border-slate-800 shadow-2xl p-3.5">
-      {/* Cabecera */}
       <div className="flex items-start justify-between gap-2">
         <div className="flex items-center gap-2.5 min-w-0">
           <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-cyan-400 via-teal-500 to-orange-500 flex items-center justify-center shadow-lg shrink-0">
@@ -472,7 +431,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
               {voiceAvailable && (
                 <button
                   onClick={toggleVoice}
-                  title={voiceEnabled ? "Desactivar voz de Flamey" : "Activar voz de Flamey"}
+                  title={voiceEnabled ? "Silenciar resumen de voz" : "Activar resumen de voz"}
                   className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border font-hud text-[10px] transition cursor-pointer ${
                     voiceEnabled
                       ? "bg-teal-500/20 border-teal-400 text-teal-200"
@@ -481,7 +440,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
                 >
                   {voiceEnabled ? (
                     <>
-                      <Volume2 className="w-3 h-3 text-teal-300 animate-pulse" />
+                      <Volume2 className="w-3 h-3 text-teal-300" />
                       <span>Voz ON</span>
                     </>
                   ) : (
@@ -521,7 +480,6 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
         </button>
       </div>
 
-      {/* Cuerpo */}
       {mode === "finding" && context && (
         <div className="mt-3 space-y-2.5 max-h-64 overflow-y-auto pr-1">
           {isLocalModel && loadingModel ? (
@@ -589,7 +547,6 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
         </form>
       )}
 
-      {/* Barra inferior */}
       <div className="mt-3 pt-2 border-t border-slate-800/80 flex items-center justify-between gap-2">
         <button
           disabled={!canAsk}
