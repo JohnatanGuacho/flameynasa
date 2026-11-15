@@ -45,6 +45,7 @@ import {
   Trash2,
   Sun,
   Moon,
+  ArrowLeftRight,
 } from "lucide-react";
 
 interface Props {
@@ -57,16 +58,24 @@ interface ChatMsg {
   text: string;
 }
 
+type Side = "left" | "right";
+
 const RAG_MODE = "psi-rag";
 const PSI_PER_ATM = 14.696;
+const EARTH_O2_PCT = 21;
 // Un cambio de experimento cuenta como "pedido por la persona" si llega
 // justo después de un clic o Enter. Si no, Flamey espera.
 const EXPLICIT_WINDOW_MS = 700;
 // Turnos previos que se envían al modelo.
 const HISTORY_TURNS = 6;
 const THEME_STORAGE_KEY = "flamey-theme";
+const SIDE_STORAGE_KEY = "flamey-side";
 // Clave del entorno "traje espacial" en la API (valor por defecto del OpenAPI).
 const SUIT_ENV_KEY = "eva";
+// Píxeles que hay que mover antes de considerar que es un arrastre y no un clic.
+const DRAG_THRESHOLD_PX = 4;
+// Margen mínimo entre Flamey y los bordes (menú lateral y ventana).
+const EDGE_GAP_PX = 8;
 
 const AFFIRMATIVE = /^\s*(s[ií]|claro|dale|ok|okay|vale|bueno|por favor|de una)\b/i;
 
@@ -160,8 +169,20 @@ const toAtm = (psi: number): number => psi / PSI_PER_ATM;
 const fmt = (n: number, d = 2): string =>
   n.toLocaleString("es", { maximumFractionDigits: d });
 
+const cap = (s: string): string => s.charAt(0).toUpperCase() + s.slice(1);
+
+/** Acepta O2 como fracción (0.32) o como porcentaje (32). */
+const toPct = (v: number): number => Math.round(v <= 1 ? v * 100 : v);
+
 const modelLabel = (m: string): string =>
-  m === RAG_MODE ? "Rápido (sin GPU)" : `IA local · ${m.split(":")[0]}`;
+  m === RAG_MODE ? "Datos NASA (sin modelo)" : `IA local · ${m.split(":")[0]}`;
+
+/** Borde derecho del menú lateral: Flamey nunca pasa de ahí. */
+function navRightEdge(): number {
+  if (typeof document === "undefined") return 0;
+  const nav = document.querySelector('nav[aria-label="Secciones"]');
+  return nav ? nav.getBoundingClientRect().right : 0;
+}
 
 /* ------------------------------------------------------------------ */
 /*  Datos de materiales y entornos                                     */
@@ -257,12 +278,6 @@ const ENV_PRESETS = [
   { id: "rover", short: "Rover", label: "Rover", o2: 34, psi: 8.0, g: 0.165 },
   { id: "mars", short: "Marte", label: "Marte", o2: 21, psi: 14.7, g: 0.38 },
   { id: "eva", short: "EVA", label: "Traje EVA", o2: 100, psi: 4.3, g: 0 },
-];
-
-const QUICK_QUESTIONS = [
-  "¿Es peligroso en traje EVA?",
-  "¿Cómo se apaga en 0g?",
-  "¿Qué material lo reemplaza?",
 ];
 
 /* ------------------------------------------------------------------ */
@@ -382,10 +397,6 @@ function computeSimulationPhysics(params: {
   };
 }
 
-/* ------------------------------------------------------------------ */
-/*  Respuestas del modo Rápido (sin IA): prosa natural, sin etiquetas  */
-/* ------------------------------------------------------------------ */
-
 function buildFallbackSimulationReport(
   sim: SimulationInput,
   presetNote?: string
@@ -417,69 +428,289 @@ function buildFallbackSimulationReport(
   )} atm, la llama avanzaría a ${sim.spreadMmPerSec} mm/s. ${why} ${alt}`;
 }
 
-function buildPsiRagReport(
+/* ------------------------------------------------------------------ */
+/*  Motor de respuestas con datos de la NASA (funciona sin modelo)     */
+/* ------------------------------------------------------------------ */
+
+/** Cada factor del RPI explicado como una causa fácil de entender. */
+const FACTOR_REASONS: Record<string, string> = {
+  o2_margin: "con este oxígeno al material le falta muy poco para arder",
+  o2_extrapolation: "aquí hay más oxígeno del que se probó en el ensayo",
+  pressure_extrapolation: "el ensayo se hizo con otra presión",
+  gravity_extrapolation: "el ensayo se hizo con otra gravedad",
+  soot_load: "la llama suelta mucho hollín y humo",
+  cool_flame: "pueden aparecer llamas frías, casi invisibles",
+  evidence_weakness: "hay pocos datos y no son muy confiables",
+  material_fit: "el material se parece a los que se usan en este entorno",
+  egress_window: "la tripulación tendría poco tiempo para salir",
+  measured_sustain: "en el ensayo la llama se mantuvo encendida sin apagarse sola",
+  evidence_density: "el experimento se repitió pocas veces",
+};
+
+/** Una acción concreta según la causa principal. */
+const FACTOR_ACTIONS: Record<string, string> = {
+  o2_margin: "usar solo materiales que no arden con tanto oxígeno, como Nomex o PBI",
+  o2_extrapolation: "usar solo materiales que no arden con tanto oxígeno, como Nomex o PBI",
+  pressure_extrapolation: "probar el material con la presión real antes de usarlo",
+  gravity_extrapolation: "probar el material con la gravedad real antes de usarlo",
+  soot_load: "instalar detectores de humo más sensibles",
+  cool_flame: "instalar sensores que detecten llamas que no se ven",
+  evidence_weakness: "repetir el ensayo antes de confiar en este material",
+  material_fit: "cambiarlo por una tela que no arde, como Nomex o PBI",
+  egress_window: "tener un extintor a mano y la salida siempre despejada",
+  measured_sustain: "cortar el flujo de aire para que la llama se apague",
+  evidence_density: "repetir el ensayo antes de confiar en este material",
+};
+
+const DEFAULT_REASON = "con más oxígeno los materiales arden con más facilidad";
+const DEFAULT_ACTION = "cambiarlo por una tela que no arde, como Nomex o PBI";
+
+type IntentId =
+  | "suit"
+  | "extinguish"
+  | "replace"
+  | "evidence"
+  | "speed"
+  | "conditions"
+  | "why";
+
+/**
+ * Temas que Flamey sabe responder. El orden importa: se revisan de arriba abajo.
+ * `ask` es la pregunta de cierre; las tres primeras coinciden con las de ollama.ts.
+ */
+const INTENTS: { id: IntentId; match: RegExp; ask: string; chip: string }[] = [
+  {
+    id: "suit",
+    match: /\beva\b|traje/i,
+    ask: "¿Quieres compararlo con lo que pasaría dentro de un traje espacial?",
+    chip: "¿Y en un traje espacial?",
+  },
+  {
+    id: "extinguish",
+    match: /apag|extin|supres|sofoc/i,
+    ask: "¿Quieres saber cómo se apagaría esta llama sin gravedad?",
+    chip: "¿Cómo se apaga?",
+  },
+  {
+    id: "replace",
+    match: /reempl|sustit|alternativ|otro material|qu[eé] material/i,
+    ask: "¿Quieres saber qué material podría reemplazarlo?",
+    chip: "¿Qué lo reemplaza?",
+  },
+  {
+    id: "evidence",
+    match: /confiab|evidenc|fuente|corrida|calidad|cu[aá]ntos datos|de d[oó]nde/i,
+    ask: "¿Quieres saber qué tan confiables son estos datos?",
+    chip: "¿Es confiable?",
+  },
+  {
+    id: "speed",
+    match: /velocidad|r[aá]pid|avanza|propag/i,
+    ask: "¿Quieres saber qué tan rápido avanzaría la llama?",
+    chip: "¿Qué tan rápido avanza?",
+  },
+  {
+    id: "conditions",
+    match: /condicion|se prob[oó]|c[oó]mo se hizo|ensay|presi[oó]n|gravedad|ox[ií]geno/i,
+    ask: "¿Quieres saber en qué condiciones se hizo el ensayo?",
+    chip: "¿Cómo se probó?",
+  },
+  {
+    id: "why",
+    match: /por qu[eé]|causa|raz[oó]n|motivo|riesgo|peligro/i,
+    ask: "¿Quieres saber por qué tiene ese nivel de riesgo?",
+    chip: "¿Por qué ese riesgo?",
+  },
+];
+
+// Orden en que Flamey va ofreciendo temas y mostrando los botones.
+const ASK_ORDER: IntentId[] = [
+  "why",
+  "suit",
+  "replace",
+  "extinguish",
+  "evidence",
+  "speed",
+  "conditions",
+];
+
+// Estos temas son datos exactos: se responden siempre desde la base, con o sin modelo.
+const DATA_ONLY = new Set<IntentId>(["why", "evidence", "speed", "conditions"]);
+
+/** De qué habla la persona. Un "sí" responde a la última pregunta de Flamey. */
+function detectIntent(text: string, lastFlamey: string): IntentId | null {
+  const direct = INTENTS.find((i) => i.match.test(text));
+  if (direct) return direct.id;
+  if (AFFIRMATIVE.test(text) && lastFlamey) {
+    const offered = INTENTS.find((i) => lastFlamey.includes(i.ask));
+    if (offered) return offered.id;
+  }
+  return null;
+}
+
+/** Temas ya tocados en la conversación (más el actual, si lo hay). */
+function coveredIntents(history: ChatMsg[], current?: IntentId | null): Set<IntentId> {
+  const covered = new Set<IntentId>();
+  history.forEach((m, i) => {
+    if (m.role !== "user") return;
+    const prev = history[i - 1]?.role === "flamey" ? history[i - 1].text : "";
+    const found = detectIntent(m.text, prev);
+    if (found) covered.add(found);
+  });
+  if (current) covered.add(current);
+  return covered;
+}
+
+/** Velocidad de propagación que la API deja escrita en el registro técnico. */
+function spreadOf(finding: FindingOut): number | null {
+  const m = (finding.narrative || "").match(
+    /propagaci[oó]n de\s*([\d.,]+)\s*mm\/s/i
+  );
+  if (!m) return null;
+  const n = parseFloat(m[1].replace(",", "."));
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function vsEarth(o2Pct: number): string {
+  const diff = o2Pct - EARTH_O2_PCT;
+  if (diff >= 2) return `${diff} puntos más que en la Tierra`;
+  if (diff <= -2) return `${Math.abs(diff)} puntos menos que en la Tierra`;
+  return "igual que en la Tierra";
+}
+
+/** Temas que tienen sentido para este experimento y entorno. */
+function availableIntents(ctx: ContextOut): IntentId[] {
+  return ASK_ORDER.filter((id) => {
+    if (id === "suit") return ctx.environment.key !== SUIT_ENV_KEY;
+    if (id === "speed") return spreadOf(ctx.finding) !== null;
+    return true;
+  });
+}
+
+/**
+ * Respuesta armada solo con datos de la API, en lenguaje sencillo.
+ * `intent` = "explain" para la explicación inicial, o null si no se entendió.
+ */
+function answerFromData(
   ctx: ContextOut,
-  question?: string,
+  intent: IntentId | "explain" | null,
+  covered: Set<IntentId>,
   suitContext?: ContextOut
 ): string {
   const { finding, environment } = ctx;
   const o2Pct = Math.round(environment.o2_fraction * 100);
   const atm = fmt(environment.pressure_atm);
-  const isCritical = o2Pct >= 30;
-  const material = finding.material || "la muestra";
-  const where = `En ${environment.label}, con ${o2Pct}% de O₂ a ${atm} atm`;
+  const material = finding.material || "una muestra de prueba";
+  const band = String(finding.band || "").toLowerCase();
+  const gravity =
+    environment.gravity_g === 0 ? "microgravedad" : `${environment.gravity_g} g`;
 
-  if (question) {
-    const q = question.toLowerCase();
+  const ranked = [...(finding.factors || [])].sort(
+    (a, b) => b.contribution - a.contribution
+  );
+  const mainReason = FACTOR_REASONS[ranked[0]?.name] || DEFAULT_REASON;
+  const mainAction = FACTOR_ACTIONS[ranked[0]?.name] || DEFAULT_ACTION;
 
-    if (q.includes("reempl") || q.includes("sustit") || q.includes("alternativ")) {
-      return `Lo más seguro es cambiar ${material} por una tela que no arde, como Nomex o PBI, o por teflón en los cables. ${where}, esos materiales aguantan mucho mejor. ¿Quieres saber cómo se apagaría esta llama sin gravedad?`;
+  const nextId = availableIntents(ctx).find((id) => !covered.has(id));
+  const ask = nextId ? ` ${INTENTS.find((i) => i.id === nextId)!.ask}` : "";
+
+  switch (intent) {
+    case "explain": {
+      const runs =
+        finding.observations > 0 ? ` en ${finding.observations} corridas` : "";
+      return `En el experimento ${finding.experiment} se quemó ${material}${runs}. En ${environment.label} el aire tiene ${o2Pct}% de O₂, ${vsEarth(
+        o2Pct
+      )}. El riesgo es ${band}, ${finding.rpi} de 100, sobre todo porque ${mainReason}. Lo que conviene es ${mainAction}.${ask}`;
     }
 
-    if (
-      q.includes("apag") ||
-      q.includes("supres") ||
-      q.includes("preven") ||
-      q.includes("mitig")
-    ) {
-      return `Sin gravedad la llama no sube, así que lo primero es cortar el flujo de aire que la alimenta. Después se puede diluir el aire con dióxido de carbono o helio. La tripulación tendría unos ${environment.egress_s} segundos para salir. ¿Quieres saber qué material podría reemplazarlo?`;
+    case "why": {
+      const reasons = ranked
+        .slice(0, 3)
+        .map((f) => FACTOR_REASONS[f.name])
+        .filter(Boolean);
+      if (reasons.length === 0) {
+        return `El riesgo en ${environment.label} es ${finding.rpi} de 100 porque ${DEFAULT_REASON}.${ask}`;
+      }
+      const [first, second, third] = reasons;
+      return `El riesgo en ${environment.label} es ${band}, ${finding.rpi} de 100. ${cap(
+        first
+      )}.${second ? ` Además, ${second}.` : ""}${
+        third ? ` Y por último, ${third}.` : ""
+      }${ask}`;
     }
 
-    if (q.includes("eva") || q.includes("traje") || suitContext) {
+    case "suit": {
       if (suitContext) {
         const suit = suitContext.finding;
         const suitO2 = Math.round(suitContext.environment.o2_fraction * 100);
+        const delta = suit.rpi - finding.rpi;
+        const verdict =
+          delta > 2
+            ? "En el traje sería más peligroso."
+            : delta < -2
+            ? "El riesgo calculado en el traje es menor."
+            : "El riesgo es parecido en los dos sitios.";
+        const suitSpread = spreadOf(suit);
         return `Dentro del traje espacial el aire tiene ${suitO2}% de O₂ a ${fmt(
           suitContext.environment.pressure_atm
         )} atm. Para este mismo experimento el riesgo allí es ${suit.rpi} de 100, y en ${
           environment.label
-        } es ${finding.rpi} de 100. ${
-          suit.rpi > finding.rpi
-            ? "En el traje sería más peligroso."
-            : "El riesgo calculado en el traje no es mayor."
-        } ¿Quieres saber qué material podría reemplazarlo?`;
+        } es ${finding.rpi} de 100. ${verdict}${
+          suitSpread ? ` Allí la llama avanzaría a unos ${fmt(suitSpread)} mm/s.` : ""
+        }${ask}`;
       }
-      return `Dentro de un traje espacial el aire es oxígeno puro, así que ${material} ardería con mucha más facilidad que en ${environment.label}. Por eso los trajes solo usan telas que no arden. ¿Quieres saber qué material podría reemplazarlo?`;
+      return `Dentro de un traje espacial el aire es oxígeno puro, así que ${material} ardería con mucha más facilidad que en ${environment.label}. Por eso los trajes solo usan telas que no arden.${ask}`;
     }
 
-    if (q.includes("luna") || q.includes("peligro") || q.includes("usar")) {
-      return `${where}, ${
-        isCritical
-          ? `${material} es peligroso, porque con tanto oxígeno arde con facilidad.`
-          : `${material} tiene un riesgo moderado si el aire circula con normalidad.`
-      } ¿Quieres saber qué material podría reemplazarlo?`;
+    case "extinguish":
+      return `Sin gravedad el aire caliente no sube, así que la llama depende del aire que le llega. Lo primero es cortar la ventilación; después se diluye el aire con dióxido de carbono o helio, como probó el experimento FLEX. La tripulación tendría unos ${environment.egress_s} segundos para salir.${ask}`;
+
+    case "replace":
+      return `Los materiales que no arden y ya se usan en misiones son Nomex y PBI para las telas, y teflón para aislar cables. Para este caso lo que conviene es ${mainAction}.${ask}`;
+
+    case "evidence": {
+      const quality = Math.round(finding.quality * 100);
+      const records = ctx.evidence?.length || 0;
+      const caution =
+        finding.observations < 5 || quality < 60
+          ? " Son pocos datos o de calidad baja, así que tómalo como una orientación."
+          : " Es una base sólida para este tipo de ensayo.";
+      return `Esto sale de ${finding.observations} corridas del experimento ${finding.experiment}, con una calidad de dato del ${quality}%.${
+        records > 0
+          ? ` Hay ${records} registros de la base PSI detrás; puedes verlos con el botón de registros de abajo.`
+          : ""
+      }${caution}${ask}`;
     }
 
-    return `De ${finding.experiment} tengo ${finding.observations} corridas con ${material}. ${where}, el nivel de riesgo es ${finding.band}, ${finding.rpi} de 100. ¿Quieres saber qué material podría reemplazarlo?`;
+    case "speed": {
+      const spread = spreadOf(finding);
+      if (spread === null) {
+        return `La base no trae una velocidad estimada para este experimento en ${environment.label}.${ask}`;
+      }
+      return `En ${environment.label} la llama avanzaría a unos ${fmt(
+        spread
+      )} mm/s, que son cerca de ${fmt(spread * 6, 1)} centímetros por minuto. Es una proyección a partir del ensayo, no una medición directa en ese entorno.${ask}`;
+    }
+
+    case "conditions": {
+      const hasO2 = finding.o2_max != null && finding.o2_max > 0;
+      const lo = hasO2 ? toPct(finding.o2_min ?? finding.o2_max!) : null;
+      const hi = hasO2 ? toPct(finding.o2_max!) : null;
+      const tested = hasO2
+        ? `El ensayo se hizo con ${lo === hi ? `${hi}%` : `entre ${lo}% y ${hi}%`} de O₂${
+            finding.pressure_atm != null ? ` a ${fmt(finding.pressure_atm)} atm` : ""
+          }.`
+        : "La base no registra con cuánto oxígeno se hizo este ensayo.";
+      const gap =
+        hasO2 && hi !== null && o2Pct > hi
+          ? " Aquí hay más oxígeno del que se probó, así que el resultado es una estimación."
+          : "";
+      return `${tested} ${environment.label} tiene ${o2Pct}% de O₂ a ${atm} atm y ${gravity}.${gap}${ask}`;
+    }
+
+    default:
+      return `No tengo ese dato para ${finding.experiment}. Lo que sí sé es que en ${environment.label} el riesgo es ${band}, ${finding.rpi} de 100.${ask}`;
   }
-
-  return `En el experimento ${finding.experiment} se probó ${material} en ${
-    finding.observations
-  } corridas. ${where}, ${
-    isCritical
-      ? "ardería con más facilidad y la llama avanzaría más rápido."
-      : "el riesgo es moderado, pero hay que vigilar que el oxígeno no se acumule."
-  } Lo más seguro es usar telas que no arden, como Nomex o PBI. ¿Quieres saber cómo se apagaría esta llama sin gravedad?`;
 }
 
 /* ------------------------------------------------------------------ */
@@ -551,7 +782,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
   const [voiceEnabled, setVoiceEnabled] = useState(false);
   const [voiceAvailable, setVoiceAvailable] = useState(false);
 
-  // Motor: PSI-RAG (instantáneo) o modelo local de Ollama
+  // Motor: datos NASA (sin modelo) o modelo local de Ollama
   const [models, setModels] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState<string>(RAG_MODE);
   const [scanning, setScanning] = useState(false);
@@ -573,6 +804,10 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
   const [simEnvName, setSimEnvName] = useState<string>("Traje EVA");
   const [simAnalysis, setSimAnalysis] = useState<string>("");
 
+  // Posición: lado de la pantalla y desplazamiento mientras se arrastra
+  const [side, setSide] = useState<Side>("left");
+  const [dragX, setDragX] = useState(0);
+
   const prevModelRef = useRef<string>(RAG_MODE);
   const warmupAbortRef = useRef<AbortController | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
@@ -582,6 +817,14 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
   const lastInputRef = useRef(0);
   const lastEnvChangeRef = useRef(0);
   const listRef = useRef<HTMLDivElement | null>(null);
+  const rootRef = useRef<HTMLElement | null>(null);
+  const dragRef = useRef<{
+    startX: number;
+    minDx: number;
+    maxDx: number;
+    moved: boolean;
+  } | null>(null);
+  const suppressClickRef = useRef(false);
 
   const t = THEMES[themeName];
 
@@ -620,15 +863,27 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
   const lastFlameyText =
     [...messages].reverse().find((m) => m.role === "flamey")?.text || "";
 
-  /* ---------------- Tema ---------------- */
+  // Botones de pregunta: solo los temas que aún no se han tocado.
+  const quickChips = useMemo(() => {
+    if (!context) return [];
+    const covered = coveredIntents(messages);
+    return availableIntents(context)
+      .filter((id) => !covered.has(id))
+      .map((id) => INTENTS.find((i) => i.id === id)!);
+  }, [context, messages]);
 
-  // Se lee en un efecto (no en el estado inicial) para no romper el prerender.
+  /* ---------------- Tema y posición guardados ---------------- */
+
+  // Se leen en un efecto (no en el estado inicial) para no romper el prerender.
   useEffect(() => {
     try {
-      const saved = window.localStorage.getItem(THEME_STORAGE_KEY);
-      if (saved === "light" || saved === "dark") setThemeName(saved);
+      const savedTheme = window.localStorage.getItem(THEME_STORAGE_KEY);
+      if (savedTheme === "light" || savedTheme === "dark") setThemeName(savedTheme);
+
+      const savedSide = window.localStorage.getItem(SIDE_STORAGE_KEY);
+      if (savedSide === "left" || savedSide === "right") setSide(savedSide);
     } catch {
-      // Sin acceso a localStorage: se queda en oscuro
+      // Sin acceso a localStorage: oscuro y a la izquierda
     }
   }, []);
 
@@ -640,6 +895,74 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
     } catch {
       // Ignorar
     }
+  };
+
+  const saveSide = (next: Side) => {
+    setSide(next);
+    try {
+      window.localStorage.setItem(SIDE_STORAGE_KEY, next);
+    } catch {
+      // Ignorar
+    }
+  };
+
+  /* ---------------- Arrastre a izquierda o derecha ---------------- */
+
+  const onDragStart = (e: React.PointerEvent<HTMLElement>) => {
+    if (e.button !== 0 || !rootRef.current) return;
+    const rect = rootRef.current.getBoundingClientRect();
+    dragRef.current = {
+      startX: e.clientX,
+      // Límites: no pasar sobre el menú lateral ni salirse de la ventana.
+      minDx: navRightEdge() + EDGE_GAP_PX - rect.left,
+      maxDx: window.innerWidth - EDGE_GAP_PX - rect.right,
+      moved: false,
+    };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+
+  const onDragMove = (e: React.PointerEvent<HTMLElement>) => {
+    const d = dragRef.current;
+    if (!d) return;
+    const dx = e.clientX - d.startX;
+    if (Math.abs(dx) > DRAG_THRESHOLD_PX) d.moved = true;
+    if (d.moved) setDragX(Math.max(d.minDx, Math.min(d.maxDx, dx)));
+  };
+
+  const onDragEnd = () => {
+    const d = dragRef.current;
+    if (!d) return;
+    dragRef.current = null;
+
+    if (d.moved && rootRef.current) {
+      // Se queda en el lado más cercano del área libre (sin contar el menú).
+      const rect = rootRef.current.getBoundingClientRect();
+      const center = rect.left + rect.width / 2;
+      const middle = (navRightEdge() + window.innerWidth) / 2;
+      saveSide(center < middle ? "left" : "right");
+
+      // Evita que soltar el arrastre cuente como clic.
+      suppressClickRef.current = true;
+      window.setTimeout(() => {
+        suppressClickRef.current = false;
+      }, 80);
+    }
+    setDragX(0);
+  };
+
+  const dragProps = {
+    onPointerDown: onDragStart,
+    onPointerMove: onDragMove,
+    onPointerUp: onDragEnd,
+    onPointerCancel: onDragEnd,
+  };
+
+  // --sidebar-w lo publica AppShell: así Flamey nunca queda sobre el menú.
+  const positionStyle: React.CSSProperties = {
+    ...(side === "left"
+      ? { left: "calc(var(--sidebar-w, 0px) + 1rem)" }
+      : { right: "1.25rem" }),
+    transform: dragX ? `translateX(${dragX}px)` : undefined,
   };
 
   /* ---------------- Refs al día ---------------- */
@@ -696,15 +1019,19 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
     const list = await getOllamaModels();
     setModels(list);
     if (list.length > 0) {
+      // Los modelos "coder" son para programar y explican peor: van al final.
+      const chat = list.filter((m) => !m.includes("coder"));
+      const pool = chat.length > 0 ? chat : list;
       const preferred =
-        list.find((m) => m.includes("qwen2.5")) ||
-        list.find((m) => m.includes("1.5b") || m.includes("2b")) ||
-        list.find((m) => m.includes("1b")) ||
-        list[0];
+        pool.find((m) => m.includes("qwen2.5")) ||
+        pool.find((m) => m.includes("1.5b") || m.includes("2b")) ||
+        pool.find((m) => m.includes("1b")) ||
+        pool[0];
       setSelectedModel((curr) =>
         curr !== RAG_MODE && list.includes(curr) ? curr : preferred
       );
     } else {
+      // Sin Ollama: Flamey sigue funcionando con los datos de la NASA.
       setSelectedModel(RAG_MODE);
     }
     setScanning(false);
@@ -778,6 +1105,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
   /**
    * Genera una respuesta de Flamey y la añade al chat.
    * Sin `q` explica el experimento; con `q` responde usando el historial.
+   * Si hay modelo local lo usa; si no (o si falla), responde con los datos.
    */
   const generate = useCallback(
     async (ctx: ContextOut, q: string | undefined, history: ChatMsg[]) => {
@@ -796,19 +1124,14 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
         if (voiceEnabledRef.current) speakText(text);
       };
 
-      // Un "sí" responde a la última pregunta que hizo Flamey.
       const lastFlamey =
         [...history].reverse().find((m) => m.role === "flamey")?.text || "";
-      const saidYes = !!q && AFFIRMATIVE.test(q);
-
-      const asksSuit =
-        !!q &&
-        (/\beva\b|traje/i.test(q) ||
-          (saidYes && /traje espacial\?/i.test(lastFlamey)));
+      const intent = q ? detectIntent(q, lastFlamey) : null;
+      const covered = coveredIntents(history, intent);
 
       // Mismo experimento, evaluado en el traje: dato real de la API.
       let suitContext: ContextOut | undefined;
-      if (asksSuit && ctx.environment.key !== SUIT_ENV_KEY) {
+      if (intent === "suit" && ctx.environment.key !== SUIT_ENV_KEY) {
         try {
           suitContext = await api.findingContext(ctx.finding.key, SUIT_ENV_KEY);
         } catch {
@@ -817,20 +1140,15 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
         if (controller.signal.aborted) return;
       }
 
-      // Para el modo Rápido, un "sí" se traduce al tema que Flamey ofreció.
-      let ragQuestion = q;
-      if (saidYes) {
-        if (asksSuit) ragQuestion = "traje";
-        else if (/apagar[ií]a/i.test(lastFlamey)) ragQuestion = "apagar";
-        else if (/reemplazar/i.test(lastFlamey)) ragQuestion = "reemplazo";
-      }
-      const fallback = () => buildPsiRagReport(ctx, ragQuestion, suitContext);
+      const fromData = () =>
+        answerFromData(ctx, q ? intent : "explain", covered, suitContext);
 
       const model = selectedModelRef.current;
       const useLocal = model !== RAG_MODE && modelReadyRef.current;
 
-      if (!useLocal) {
-        deliver(fallback());
+      // Sin modelo, o pregunta de dato exacto: se responde desde la base.
+      if (!useLocal || (intent && DATA_ONLY.has(intent))) {
+        deliver(fromData());
         return;
       }
 
@@ -857,7 +1175,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
       }
 
       if (controller.signal.aborted) return;
-      deliver(finalReply.trim() || fallback());
+      deliver(finalReply.trim() || fromData());
     },
     []
   );
@@ -999,10 +1317,19 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
   if (!open) {
     return (
       <button
+        ref={(el) => {
+          rootRef.current = el;
+        }}
         type="button"
-        onClick={() => setOpen(true)}
+        {...dragProps}
+        onClick={() => {
+          if (suppressClickRef.current) return;
+          setOpen(true);
+        }}
+        style={positionStyle}
+        title="Abrir Flamey. Arrastra para moverlo de lado."
         aria-label="Abrir asistente Flamey"
-        className={`fixed bottom-5 left-16 z-30 flex cursor-pointer items-center gap-2 rounded-full border px-3.5 py-2 shadow-2xl transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${t.pill}`}
+        className={`fixed bottom-5 z-30 flex cursor-pointer touch-none select-none items-center gap-2 rounded-full border px-3.5 py-2 shadow-2xl focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${t.pill}`}
       >
         <Flame className="h-4 w-4 text-orange-500" />
         <span className="font-hud text-xs font-bold tracking-wide">FLAMEY</span>
@@ -1012,7 +1339,6 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
   }
 
   const isLocalModel = selectedModel !== RAG_MODE;
-  const canAsk = !isLocalModel || modelReady;
   const shortModelName = selectedModel.split(":")[0];
   const meta = VERDICT_META[simResult.verdict];
   const VerdictIcon = meta.Icon;
@@ -1027,7 +1353,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
     ? "bg-emerald-500"
     : "bg-teal-500";
   const statusTitle = loadingModel
-    ? `Cargando ${shortModelName}...`
+    ? `Cargando ${shortModelName}... mientras tanto respondo con los datos`
     : modelLabel(selectedModel);
 
   /* ---------------- Vista abierta ---------------- */
@@ -1035,14 +1361,23 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
   return (
     <ThemeCtx.Provider value={t}>
       <aside
+        ref={(el) => {
+          rootRef.current = el;
+        }}
+        style={positionStyle}
         aria-label="Asistente de seguridad contra incendios Flamey"
-        className={`fixed bottom-5 left-16 z-30 flex max-h-[70vh] w-[320px] flex-col overflow-hidden rounded-2xl border shadow-2xl backdrop-blur-xl ${t.panel}`}
+        className={`fixed bottom-5 z-30 flex max-h-[70vh] w-[320px] flex-col overflow-hidden rounded-2xl border shadow-2xl backdrop-blur-xl ${t.panel}`}
       >
         {/* CABECERA */}
         <div
           className={`flex shrink-0 items-center justify-between gap-2 border-b px-3 py-2 ${t.divider}`}
         >
-          <div className="flex min-w-0 items-center gap-2">
+          {/* Zona de arrastre: mueve Flamey a izquierda o derecha */}
+          <div
+            {...dragProps}
+            title="Arrastra para mover Flamey de lado"
+            className="flex min-w-0 flex-1 cursor-grab touch-none select-none items-center gap-2 active:cursor-grabbing"
+          >
             <Flame className="h-4 w-4 shrink-0 text-orange-500" />
             <h2 className={`font-hud text-xs font-bold tracking-wider ${t.title}`}>
               FLAMEY
@@ -1079,7 +1414,13 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
               )}
             </IconBtn>
             <IconBtn
-              label="Elegir motor de IA"
+              label={side === "left" ? "Mover a la derecha" : "Mover a la izquierda"}
+              onClick={() => saveSide(side === "left" ? "right" : "left")}
+            >
+              <ArrowLeftRight className="h-3.5 w-3.5" />
+            </IconBtn>
+            <IconBtn
+              label="Elegir motor de respuestas"
               active={showSettings}
               onClick={() => setShowSettings((v) => !v)}
             >
@@ -1097,34 +1438,39 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
           </div>
         </div>
 
-        {/* MOTOR DE IA (oculto por defecto) */}
+        {/* MOTOR DE RESPUESTAS (oculto por defecto) */}
         {showSettings && (
-          <div
-            className={`flex shrink-0 items-center gap-1.5 border-b px-3 py-2 ${t.divider}`}
-          >
-            <label htmlFor="flamey-model-select" className="sr-only">
-              Motor de IA
-            </label>
-            <select
-              id="flamey-model-select"
-              value={selectedModel}
-              onChange={(e) => setSelectedModel(e.target.value)}
-              className={`h-7 min-w-0 flex-1 cursor-pointer rounded-lg border px-2 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${t.modelSelect}`}
-            >
-              <option value={RAG_MODE}>{modelLabel(RAG_MODE)}</option>
-              {models.map((m) => (
-                <option key={m} value={m}>
-                  {modelLabel(m)}
-                </option>
-              ))}
-            </select>
-            <IconBtn
-              label="Buscar modelos en Ollama"
-              disabled={scanning}
-              onClick={scanLocalModels}
-            >
-              <RefreshCw className={`h-3.5 w-3.5 ${scanning ? "animate-spin" : ""}`} />
-            </IconBtn>
+          <div className={`shrink-0 space-y-1.5 border-b px-3 py-2 ${t.divider}`}>
+            <div className="flex items-center gap-1.5">
+              <label htmlFor="flamey-model-select" className="sr-only">
+                Motor de respuestas
+              </label>
+              <select
+                id="flamey-model-select"
+                value={selectedModel}
+                onChange={(e) => setSelectedModel(e.target.value)}
+                className={`h-7 min-w-0 flex-1 cursor-pointer rounded-lg border px-2 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${t.modelSelect}`}
+              >
+                <option value={RAG_MODE}>{modelLabel(RAG_MODE)}</option>
+                {models.map((m) => (
+                  <option key={m} value={m}>
+                    {modelLabel(m)}
+                  </option>
+                ))}
+              </select>
+              <IconBtn
+                label="Buscar modelos en Ollama"
+                disabled={scanning}
+                onClick={scanLocalModels}
+              >
+                <RefreshCw className={`h-3.5 w-3.5 ${scanning ? "animate-spin" : ""}`} />
+              </IconBtn>
+            </div>
+            {models.length === 0 && !scanning && (
+              <p className={`text-[11px] ${t.muted}`}>
+                No encontré Ollama en este equipo. Respondo con los datos de la NASA.
+              </p>
+            )}
           </div>
         )}
 
@@ -1207,8 +1553,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
                     <button
                       type="button"
                       onClick={explainCurrent}
-                      disabled={!canAsk}
-                      className="flex h-9 w-full cursor-pointer items-center justify-center gap-1.5 rounded-xl bg-teal-500 text-xs font-semibold text-slate-950 hover:bg-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300 disabled:opacity-40"
+                      className="flex h-9 w-full cursor-pointer items-center justify-center gap-1.5 rounded-xl bg-teal-500 text-xs font-semibold text-slate-950 hover:bg-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300"
                     >
                       <Sparkles className="h-3.5 w-3.5" />
                       Explicar este experimento
@@ -1259,20 +1604,22 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
                     </div>
                   )}
 
-                  {/* Preguntas rápidas */}
-                  <div className="-mx-3 flex gap-1.5 overflow-x-auto px-3 pb-0.5">
-                    {QUICK_QUESTIONS.map((qText) => (
-                      <button
-                        key={qText}
-                        type="button"
-                        disabled={!canAsk || streaming}
-                        onClick={() => submitQuestion(qText)}
-                        className={`shrink-0 cursor-pointer whitespace-nowrap rounded-full border px-2.5 py-1 text-[11px] disabled:opacity-40 ${t.chip}`}
-                      >
-                        {qText}
-                      </button>
-                    ))}
-                  </div>
+                  {/* Preguntas sugeridas: solo las que faltan por hacer */}
+                  {quickChips.length > 0 && (
+                    <div className="-mx-3 flex gap-1.5 overflow-x-auto px-3 pb-0.5">
+                      {quickChips.map((chip) => (
+                        <button
+                          key={chip.id}
+                          type="button"
+                          disabled={streaming}
+                          onClick={() => submitQuestion(chip.chip)}
+                          className={`shrink-0 cursor-pointer whitespace-nowrap rounded-full border px-2.5 py-1 text-[11px] disabled:opacity-40 ${t.chip}`}
+                        >
+                          {chip.chip}
+                        </button>
+                      ))}
+                    </div>
+                  )}
 
                   <form onSubmit={handleAskSubmit} className="flex gap-1.5">
                     <label htmlFor="flamey-ask-input" className="sr-only">
@@ -1282,14 +1629,13 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
                       id="flamey-ask-input"
                       type="text"
                       value={question}
-                      disabled={!canAsk}
                       onChange={(e) => setQuestion(e.target.value)}
                       placeholder="Pregunta algo..."
-                      className={`h-8 min-w-0 flex-1 rounded-lg border px-2.5 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 disabled:opacity-50 ${t.field}`}
+                      className={`h-8 min-w-0 flex-1 rounded-lg border px-2.5 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${t.field}`}
                     />
                     <button
                       type="submit"
-                      disabled={!canAsk || streaming || !question.trim()}
+                      disabled={streaming || !question.trim()}
                       aria-label="Enviar pregunta"
                       className="h-8 cursor-pointer rounded-lg bg-teal-500 px-2.5 text-slate-950 hover:bg-teal-400 disabled:opacity-40"
                     >
