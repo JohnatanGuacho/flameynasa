@@ -1,4 +1,5 @@
 import { ContextOut } from "./api";
+import { SimulationInput } from "./ollama";
 
 let speakTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -6,7 +7,6 @@ export function isVoiceSupported(): boolean {
   return typeof window !== "undefined" && "speechSynthesis" in window;
 }
 
-/** Limpia Markdown y símbolos químicos para pronunciación natural */
 export function sanitizeTextForSpeech(raw: string): string {
   return raw
     .replace(/```[\s\S]*?```/g, "")
@@ -43,7 +43,6 @@ function pickBestSpanishVoice(): SpeechSynthesisVoice | null {
   );
 }
 
-/** Detiene cualquier locución en curso y limpia temporizadores pendientes */
 export function stopVoice(): void {
   if (speakTimer) {
     clearTimeout(speakTimer);
@@ -57,7 +56,6 @@ export function stopVoice(): void {
   }
 }
 
-/** Habla una sola vez sin solapamientos ni eco */
 function speakSingleUtterance(text: string, rate = 1.22): void {
   if (!isVoiceSupported()) return;
   stopVoice();
@@ -65,7 +63,6 @@ function speakSingleUtterance(text: string, rate = 1.22): void {
   const clean = sanitizeTextForSpeech(text);
   if (!clean) return;
 
-  // Retardo breve de 60ms evita que Chromium solape o corte tras cancel()
   speakTimer = setTimeout(() => {
     const utterance = new SpeechSynthesisUtterance(clean);
     const voice = pickBestSpanishVoice();
@@ -77,10 +74,10 @@ function speakSingleUtterance(text: string, rate = 1.22): void {
   }, 60);
 }
 
-/**
- * Resume en 2 frases cortas el veredicto de seguridad para el módulo activo.
- * Evita lecturas largas y comunica directo qué material es peligroso y dónde.
- */
+export function speakText(rawText: string, rate = 1.22): void {
+  speakSingleUtterance(rawText, rate);
+}
+
 export function speakFindingAlert(ctx: ContextOut): void {
   const { finding, environment } = ctx;
   const o2Pct = Math.round(environment.o2_fraction * 100);
@@ -94,7 +91,18 @@ export function speakFindingAlert(ctx: ContextOut): void {
   speakSingleUtterance(summary, 1.22);
 }
 
-/** Lee solo las primeras 2 frases (máx. 190 caracteres) de una respuesta puntual */
+export function speakSimulationVerdict(sim: SimulationInput): void {
+  let summary = "";
+  if (sim.verdict === "PROHIBIDO") {
+    summary = `Material prohibido en ${sim.environmentName} al ${sim.o2Percent} por ciento de oxígeno. Usar ${sim.materialName} presenta riesgo crítico de ignición; sustituye por Nomex, PBI o Teflón certificado.`;
+  } else if (sim.verdict === "RESTRINGIDO") {
+    summary = `Uso restringido para ${sim.materialName} en ${sim.environmentName} al ${sim.o2Percent} por ciento de oxígeno. Requiere blindaje térmico y control estricto de ignición.`;
+  } else {
+    summary = `Material aprobado. ${sim.materialName} mantiene margen seguro en ${sim.environmentName} al ${sim.o2Percent} por ciento de oxígeno y ${sim.pressurePsi} psi.`;
+  }
+  speakSingleUtterance(summary, 1.22);
+}
+
 export function speakShortReply(rawResponse: string): void {
   const clean = sanitizeTextForSpeech(rawResponse);
   if (!clean) return;

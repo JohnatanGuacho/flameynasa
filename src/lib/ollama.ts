@@ -7,6 +7,20 @@ const OLLAMA_URL = (
 const REFUSAL_PATTERN =
   /^(lo siento|disculpa|no puedo proporcionar|no puedo ayudar|como modelo|i'?m sorry|i cannot)/i;
 
+export interface SimulationInput {
+  materialName: string;
+  materialCategory: string;
+  loiPercent: number;
+  o2Percent: number;
+  pressurePsi: number;
+  gravityG: number;
+  environmentName: string;
+  verdict: "APROBADO" | "RESTRINGIDO" | "PROHIBIDO";
+  riskScore: number;
+  spreadMmPerSec: number;
+  userNote?: string;
+}
+
 export async function getOllamaModels(): Promise<string[]> {
   try {
     const res = await fetch(`${OLLAMA_URL}/api/tags`, { cache: "no-store" });
@@ -18,7 +32,6 @@ export async function getOllamaModels(): Promise<string[]> {
   }
 }
 
-/** Libera inmediatamente de la VRAM el modelo anterior al cambiar de opción */
 export async function unloadOllamaModel(model: string): Promise<void> {
   if (!model) return;
   try {
@@ -32,7 +45,6 @@ export async function unloadOllamaModel(model: string): Promise<void> {
   }
 }
 
-/** Pre-carga el modelo seleccionado en VRAM antes de habilitar preguntas */
 export async function warmupOllamaModel(
   model: string,
   signal?: AbortSignal
@@ -53,6 +65,83 @@ export async function warmupOllamaModel(
     return res.ok;
   } catch {
     return false;
+  }
+}
+
+async function streamChatCompletion(params: {
+  model: string;
+  systemPrompt: string;
+  userPrompt: string;
+  onToken: (partialText: string) => void;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const { model, systemPrompt, userPrompt, onToken, signal } = params;
+
+  const res = await fetch(`${OLLAMA_URL}/api/chat`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    signal,
+    body: JSON.stringify({
+      model,
+      stream: true,
+      keep_alive: "15m",
+      options: {
+        temperature: 0.2,
+        num_ctx: 1024,
+        num_predict: 190,
+      },
+      messages: [
+        { role: "system", content: systemPrompt },
+        { role: "user", content: userPrompt },
+      ],
+    }),
+  });
+
+  if (!res.ok || !res.body) {
+    throw new Error(`Ollama HTTP ${res.status}`);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let accumulated = "";
+  let verifiedSafeStart = false;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    const chunk = decoder.decode(value, { stream: true });
+    for (const line of chunk.split("\n")) {
+      if (!line.trim()) continue;
+      try {
+        const json = JSON.parse(line);
+        if (json.message?.content) {
+          accumulated += json.message.content;
+          const trimmed = accumulated.trimStart();
+
+          if (!verifiedSafeStart) {
+            if (REFUSAL_PATTERN.test(trimmed)) {
+              await reader.cancel();
+              throw new Error("REFUSAL_FALLBACK");
+            }
+            if (trimmed.length >= 22 || json.done) {
+              verifiedSafeStart = true;
+              onToken(accumulated);
+            }
+          } else {
+            onToken(accumulated);
+          }
+        }
+      } catch (err) {
+        if (err instanceof Error && err.message === "REFUSAL_FALLBACK") {
+          throw err;
+        }
+      }
+    }
+  }
+
+  if (!verifiedSafeStart && accumulated.trim()) {
+    onToken(accumulated);
   }
 }
 
@@ -93,73 +182,41 @@ ${
     : "Sintetiza el hallazgo científico y la medida de seguridad recomendada."
 }`;
 
-  const res = await fetch(`${OLLAMA_URL}/api/chat`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
+  return streamChatCompletion({
+    model,
+    systemPrompt,
+    userPrompt: dataPrompt,
+    onToken,
     signal,
-    body: JSON.stringify({
-      model,
-      stream: true,
-      keep_alive: "15m",
-      options: {
-        temperature: 0.2,
-        num_ctx: 1024,
-        num_predict: 180,
-      },
-      messages: [
-        { role: "system", content: systemPrompt },
-        { role: "user", content: dataPrompt },
-      ],
-    }),
   });
+}
 
-  if (!res.ok || !res.body) {
-    throw new Error(`Ollama HTTP ${res.status}`);
-  }
+export async function askMaterialSimulationStream(params: {
+  model: string;
+  sim: SimulationInput;
+  onToken: (partialText: string) => void;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const { model, sim, onToken, signal } = params;
+  const ppO2 = ((sim.o2Percent / 100) * sim.pressurePsi).toFixed(2);
 
-  const reader = res.body.getReader();
-  const decoder = new TextDecoder();
-  let accumulated = "";
-  let verifiedSafeStart = false;
+  const systemPrompt = `Eres FLAMEY, ingeniero de certificación de materiales espaciales de la NASA (estándar NASA-STD-6001B).
+Evalúa si el material consultado es seguro en la atmósfera simulada, en español, directo y máximo 70 palabras (sin títulos #):
+- **Dictamen (${sim.verdict}):** explica si es seguro o peligroso usar este material a ${sim.o2Percent}% O2 y ${sim.pressurePsi} psi (ppO2 ${ppO2} psi).
+- **Física en ${sim.gravityG === 0 ? "0g" : `${sim.gravityG}g`}:** cómo afecta la falta de nitrógeno diluyente o la baja gravedad a la ignición y propagación (${sim.spreadMmPerSec} mm/s).
+- **Alternativa NASA:** material certificado recomendado o límite operativo.`;
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
+  const userPrompt = `Simulación de certificación NASA:
+Material: ${sim.materialName} (${sim.materialCategory}, Índice Límite de Oxígeno LOI ~${sim.loiPercent}%).
+Entorno: ${sim.environmentName} | O2: ${sim.o2Percent}% | Presión: ${sim.pressurePsi} psi (ppO2: ${ppO2} psi) | Gravedad: ${sim.gravityG}g.
+Resultado del modelo físico: ${sim.verdict} (Riesgo ${sim.riskScore}/100, propagación ~${sim.spreadMmPerSec} mm/s).
+${sim.userNote ? `Consulta adicional: ${sim.userNote}` : "Evalúa su uso en cabina o traje EVA."}`;
 
-    const chunk = decoder.decode(value, { stream: true });
-    for (const line of chunk.split("\n")) {
-      if (!line.trim()) continue;
-      try {
-        const json = JSON.parse(line);
-        if (json.message?.content) {
-          accumulated += json.message.content;
-          const trimmed = accumulated.trimStart();
-
-          // Esperar los primeros 22 caracteres para verificar que no sea un falso rechazo
-          if (!verifiedSafeStart) {
-            if (REFUSAL_PATTERN.test(trimmed)) {
-              await reader.cancel();
-              throw new Error("REFUSAL_FALLBACK");
-            }
-            if (trimmed.length >= 22 || json.done) {
-              verifiedSafeStart = true;
-              onToken(accumulated);
-            }
-          } else {
-            onToken(accumulated);
-          }
-        }
-      } catch (err) {
-        if (err instanceof Error && err.message === "REFUSAL_FALLBACK") {
-          throw err;
-        }
-        // Ignorar fragmentos parciales de línea JSON
-      }
-    }
-  }
-
-  // Si la respuesta completa fue muy corta (<22 chars) y válida, emitirla al final
-  if (!verifiedSafeStart && accumulated.trim()) {
-    onToken(accumulated);
-  }
+  return streamChatCompletion({
+    model,
+    systemPrompt,
+    userPrompt,
+    onToken,
+    signal,
+  });
 }
