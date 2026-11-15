@@ -1,19 +1,20 @@
-// src/lib/voice.ts
+import { ContextOut } from "./api";
+
+let speakTimer: ReturnType<typeof setTimeout> | null = null;
 
 export function isVoiceSupported(): boolean {
   return typeof window !== "undefined" && "speechSynthesis" in window;
 }
 
-/** Limpia Markdown y símbolos técnicos para que la voz los lea de forma natural */
+/** Limpia Markdown y símbolos químicos para pronunciación natural */
 export function sanitizeTextForSpeech(raw: string): string {
   return raw
-    .replace(/```[\s\S]*?```/g, "") // Quita bloques de código
-    .replace(/`([^`]+)`/g, "$1") // Quita comillas invertidas
-    .replace(/\*\*([^*]+)\*\*/g, "$1") // Quita negritas **texto**
-    .replace(/\*([^*]+)\*/g, "$1") // Quita cursivas *texto*
-    .replace(/__([^_]+)__/g, "$1")
-    .replace(/^#{1,6}\s+/gm, "") // Quita encabezados #
-    .replace(/^\s*[-*•]\s+/gm, "") // Quita viñetas
+    .replace(/```[\s\S]*?```/g, "")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/\*([^*]+)\*/g, "$1")
+    .replace(/^#{1,6}\s+/gm, "")
+    .replace(/^\s*[-*•]\s+/gm, "")
     .replace(/\bO₂\b|\bO2\b/g, "oxígeno")
     .replace(/\bCO₂\b|\bCO2\b/g, "dióxido de carbono")
     .replace(/\bN₂\b|\bN2\b/g, "nitrógeno")
@@ -29,96 +30,78 @@ function pickBestSpanishVoice(): SpeechSynthesisVoice | null {
   if (!voices.length) return null;
 
   return (
-    voices.find((v) => v.lang.startsWith("es") && /natural|google|helena|sabina|alvaro/i.test(v.name)) ||
-    voices.find((v) => v.lang === "es-ES" || v.lang === "es-MX" || v.lang === "es-419") ||
+    voices.find(
+      (v) =>
+        v.lang.startsWith("es") &&
+        /natural|google|helena|sabina|alvaro/i.test(v.name)
+    ) ||
+    voices.find(
+      (v) => v.lang === "es-ES" || v.lang === "es-MX" || v.lang === "es-419"
+    ) ||
     voices.find((v) => v.lang.startsWith("es")) ||
     null
   );
 }
 
-/** Detiene inmediatamente cualquier locución en curso */
+/** Detiene cualquier locución en curso y limpia temporizadores pendientes */
 export function stopVoice(): void {
+  if (speakTimer) {
+    clearTimeout(speakTimer);
+    speakTimer = null;
+  }
   if (!isVoiceSupported()) return;
   try {
     window.speechSynthesis.cancel();
   } catch {
-    // Ignorar errores de cancelación en navegadores restrictivos
+    // Ignorar errores de cancelación
   }
 }
 
-/** Lee un texto completo (ideal para respuestas instantáneas PSI-RAG) */
-export function speakText(
-  rawText: string,
-  options?: { rate?: number; onEnd?: () => void }
-): void {
+/** Habla una sola vez sin solapamientos ni eco */
+function speakSingleUtterance(text: string, rate = 1.22): void {
   if (!isVoiceSupported()) return;
   stopVoice();
 
-  const clean = sanitizeTextForSpeech(rawText);
+  const clean = sanitizeTextForSpeech(text);
   if (!clean) return;
 
-  const utterance = new SpeechSynthesisUtterance(clean);
-  const voice = pickBestSpanishVoice();
-  if (voice) utterance.voice = voice;
-  utterance.lang = voice?.lang || "es-ES";
-  utterance.rate = options?.rate ?? 1.06;
-  utterance.pitch = 1.0;
-
-  if (options?.onEnd) {
-    utterance.onend = options.onEnd;
-    utterance.onerror = options.onEnd;
-  }
-
-  window.speechSynthesis.speak(utterance);
-}
-
-/**
- * Cola de locución en tiempo real para respuestas en streaming:
- * va hablando cada oración apenas termina de escribirse sin esperar al final.
- */
-export function createStreamSpeaker(rate = 1.06) {
-  let spokenLength = 0;
-  let cancelled = false;
-
-  const enqueueSentence = (sentence: string) => {
-    if (cancelled || !isVoiceSupported()) return;
-    const clean = sanitizeTextForSpeech(sentence);
-    if (!clean) return;
-
+  // Retardo breve de 60ms evita que Chromium solape o corte tras cancel()
+  speakTimer = setTimeout(() => {
     const utterance = new SpeechSynthesisUtterance(clean);
     const voice = pickBestSpanishVoice();
     if (voice) utterance.voice = voice;
     utterance.lang = voice?.lang || "es-ES";
     utterance.rate = rate;
+    utterance.pitch = 1.0;
     window.speechSynthesis.speak(utterance);
-  };
+  }, 60);
+}
 
-  return {
-    /** Alimentar con el texto acumulado del stream */
-    pushAccumulated(fullText: string) {
-      if (cancelled) return;
-      const pending = fullText.slice(spokenLength);
-      // Buscar el último cierre de oración o salto de línea doble
-      const match = pending.match(/^([\s\S]*?(?:[.!?](?:\s|$)|\n\n))/);
-      if (match && match[1].trim().length >= 12) {
-        enqueueSentence(match[1]);
-        spokenLength += match[1].length;
-      }
-    },
+/**
+ * Resume en 2 frases cortas el veredicto de seguridad para el módulo activo.
+ * Evita lecturas largas y comunica directo qué material es peligroso y dónde.
+ */
+export function speakFindingAlert(ctx: ContextOut): void {
+  const { finding, environment } = ctx;
+  const o2Pct = Math.round(environment.o2_fraction * 100);
+  const material = finding.material || "el combustible ensayado";
+  const highRisk = o2Pct >= 30 || finding.rpi >= 55;
 
-    /** Vaciar el fragmento final cuando termina el stream */
-    flush(fullText: string) {
-      if (cancelled) return;
-      const remaining = fullText.slice(spokenLength);
-      if (remaining.trim()) {
-        enqueueSentence(remaining);
-        spokenLength = fullText.length;
-      }
-    },
+  const summary = highRisk
+    ? `Alerta en ${environment.label} al ${o2Pct} por ciento de oxígeno. Es peligroso usar ${material} según el ensayo ${finding.experiment}; se recomienda sustituir por material ignífugo o aplicar dilución.`
+    : `En ${environment.label} al ${o2Pct} por ciento de oxígeno, el ensayo ${finding.experiment} con ${material} requiere control de ventilación y monitoreo continuo.`;
 
-    cancel() {
-      cancelled = true;
-      stopVoice();
-    },
-  };
+  speakSingleUtterance(summary, 1.22);
+}
+
+/** Lee solo las primeras 2 frases (máx. 190 caracteres) de una respuesta puntual */
+export function speakShortReply(rawResponse: string): void {
+  const clean = sanitizeTextForSpeech(rawResponse);
+  if (!clean) return;
+
+  const sentences = clean.split(/(?<=[.!?])\s+/).slice(0, 2).join(" ");
+  const clipped =
+    sentences.length > 190 ? `${sentences.slice(0, 187)}...` : sentences;
+
+  speakSingleUtterance(clipped, 1.22);
 }
