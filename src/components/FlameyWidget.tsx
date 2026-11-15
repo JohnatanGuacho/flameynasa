@@ -1,7 +1,15 @@
 "use client";
 
-import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { api, atmToPsi, ContextOut, FindingOut, RulesOut } from "@/lib/api";
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { api, ContextOut, FindingOut, RulesOut } from "@/lib/api";
 import {
   askMaterialSimulationStream,
   askOllamaStream,
@@ -12,17 +20,14 @@ import {
 } from "@/lib/ollama";
 import {
   isVoiceSupported,
-  speakFindingAlert,
-  speakShortReply,
   speakSimulationVerdict,
+  speakText,
   stopVoice,
 } from "@/lib/voice";
 import {
   Flame,
-  FileCheck2,
   ChevronDown,
   ChevronUp,
-  BookOpen,
   Send,
   Loader2,
   RefreshCw,
@@ -32,8 +37,14 @@ import {
   ShieldCheck,
   ShieldAlert,
   AlertTriangle,
-  Cpu,
+  Settings,
+  Lightbulb,
+  MessageCircle,
+  Database,
   Sparkles,
+  Trash2,
+  Sun,
+  Moon,
 } from "lucide-react";
 
 interface Props {
@@ -41,7 +52,120 @@ interface Props {
   environmentKey: string;
 }
 
+interface ChatMsg {
+  role: "user" | "flamey";
+  text: string;
+}
+
 const RAG_MODE = "psi-rag";
+const PSI_PER_ATM = 14.696;
+// Un cambio de experimento cuenta como "pedido por la persona" si llega
+// justo después de un clic o Enter. Si no, Flamey espera.
+const EXPLICIT_WINDOW_MS = 700;
+// Turnos previos que se envían al modelo.
+const HISTORY_TURNS = 6;
+const THEME_STORAGE_KEY = "flamey-theme";
+// Clave del entorno "traje espacial" en la API (valor por defecto del OpenAPI).
+const SUIT_ENV_KEY = "eva";
+
+const AFFIRMATIVE = /^\s*(s[ií]|claro|dale|ok|okay|vale|bueno|por favor|de una)\b/i;
+
+/* ------------------------------------------------------------------ */
+/*  Tema claro / oscuro (solo para este widget)                        */
+/* ------------------------------------------------------------------ */
+
+const THEMES = {
+  dark: {
+    panel: "border-slate-800 bg-slate-950/95",
+    pill: "border-teal-400/60 bg-slate-950/95 text-teal-200 hover:border-teal-300",
+    divider: "border-slate-800/80",
+    title: "text-white",
+    text: "text-slate-100",
+    sub: "text-slate-200",
+    soft: "text-slate-300",
+    muted: "text-slate-400",
+    accent: "text-teal-300",
+    link: "text-teal-300 hover:text-teal-200",
+    surface: "border-slate-800 bg-slate-900",
+    field:
+      "border-slate-700 bg-slate-900 text-white placeholder:text-slate-400",
+    select: "border-slate-700 bg-slate-950 text-slate-200",
+    modelSelect: "border-slate-700 bg-slate-950 text-emerald-300",
+    chip: "border-slate-700 bg-slate-900 text-teal-200 hover:bg-slate-800",
+    iconBtn: "border-slate-800 bg-slate-900 text-slate-300 hover:text-white",
+    iconBtnActive: "border-teal-400/70 bg-teal-500/20 text-teal-200",
+    userBubble: "bg-teal-500/15 text-teal-100",
+    botBubble: "border-slate-800 bg-slate-900 text-slate-100",
+    tabOn: "border-teal-400 text-teal-200",
+    tabOff: "border-transparent text-slate-400 hover:text-white",
+    envOn: "border-teal-400 bg-teal-500/20 font-bold text-teal-100",
+    envOff: "border-slate-800 bg-slate-900 text-slate-300 hover:border-slate-600",
+    track: "bg-slate-800",
+    file: "text-cyan-300",
+    myth: "text-rose-300",
+    fact: "text-emerald-200",
+    danger: "text-rose-400",
+    warn: "text-amber-300",
+    ok: "text-emerald-300",
+    info: "text-cyan-300",
+    whyDivider: "border-white/10",
+  },
+  light: {
+    panel: "border-slate-200 bg-white/95",
+    pill: "border-teal-600/50 bg-white text-teal-700 hover:border-teal-600",
+    divider: "border-slate-200",
+    title: "text-slate-900",
+    text: "text-slate-800",
+    sub: "text-slate-700",
+    soft: "text-slate-600",
+    muted: "text-slate-500",
+    accent: "text-teal-700",
+    link: "text-teal-700 hover:text-teal-900",
+    surface: "border-slate-200 bg-slate-50",
+    field:
+      "border-slate-300 bg-white text-slate-900 placeholder:text-slate-500",
+    select: "border-slate-300 bg-white text-slate-800",
+    modelSelect: "border-slate-300 bg-white text-emerald-700",
+    chip: "border-slate-300 bg-white text-teal-700 hover:bg-slate-100",
+    iconBtn: "border-slate-200 bg-white text-slate-600 hover:text-slate-900",
+    iconBtnActive: "border-teal-500 bg-teal-50 text-teal-700",
+    userBubble: "bg-teal-600 text-white",
+    botBubble: "border-slate-200 bg-slate-100 text-slate-800",
+    tabOn: "border-teal-600 text-teal-700",
+    tabOff: "border-transparent text-slate-500 hover:text-slate-900",
+    envOn: "border-teal-600 bg-teal-50 font-bold text-teal-800",
+    envOff: "border-slate-200 bg-white text-slate-600 hover:border-slate-400",
+    track: "bg-slate-200",
+    file: "text-cyan-700",
+    myth: "text-rose-700",
+    fact: "text-emerald-700",
+    danger: "text-rose-600",
+    warn: "text-amber-600",
+    ok: "text-emerald-600",
+    info: "text-cyan-700",
+    whyDivider: "border-black/10",
+  },
+};
+
+type ThemeName = keyof typeof THEMES;
+type Theme = (typeof THEMES)["dark"];
+
+const ThemeCtx = createContext<Theme>(THEMES.dark);
+
+/* ------------------------------------------------------------------ */
+/*  Helpers                                                            */
+/* ------------------------------------------------------------------ */
+
+const toAtm = (psi: number): number => psi / PSI_PER_ATM;
+const fmt = (n: number, d = 2): string =>
+  n.toLocaleString("es", { maximumFractionDigits: d });
+
+const modelLabel = (m: string): string =>
+  m === RAG_MODE ? "Rápido (sin GPU)" : `IA local · ${m.split(":")[0]}`;
+
+/* ------------------------------------------------------------------ */
+/*  Datos de materiales y entornos                                     */
+/* ------------------------------------------------------------------ */
 
 interface MaterialPreset {
   id: string;
@@ -63,7 +187,7 @@ const MATERIAL_PRESETS: MaterialPreset[] = [
     loi: 19,
     evaRated: false,
     baseSpread: 1.4,
-    note: "Inflamación rápida en >24% O₂; estrictamente prohibido en Traje EVA.",
+    note: "Arde rápido con más de 24% de O₂. Está prohibido en el traje EVA.",
   },
   {
     id: "foam",
@@ -73,7 +197,7 @@ const MATERIAL_PRESETS: MaterialPreset[] = [
     loi: 17,
     evaRated: false,
     baseSpread: 2.1,
-    note: "Alta propagación y liberación de gases tóxicos (HCN/CO) en cabina.",
+    note: "La llama avanza rápido y libera gases tóxicos en la cabina.",
   },
   {
     id: "pmma",
@@ -83,7 +207,7 @@ const MATERIAL_PRESETS: MaterialPreset[] = [
     loi: 18,
     evaRated: false,
     baseSpread: 0.9,
-    note: "Llama esférica persistente en 0g; requiere policarbonato tratado.",
+    note: "En 0g forma una llama esférica persistente. Conviene usar policarbonato tratado.",
   },
   {
     id: "nylon",
@@ -93,7 +217,7 @@ const MATERIAL_PRESETS: MaterialPreset[] = [
     loi: 24,
     evaRated: false,
     baseSpread: 0.85,
-    note: "Margen justo en ISS; goteo fundido peligroso en hábitat Lunar (32% O₂).",
+    note: "Tiene poco margen en la ISS y gotea fundido en el hábitat lunar.",
   },
   {
     id: "silicone",
@@ -103,7 +227,7 @@ const MATERIAL_PRESETS: MaterialPreset[] = [
     loi: 30,
     evaRated: false,
     baseSpread: 0.55,
-    note: "Apto en ISS (21% O₂), pero restringido en atmósferas enriquecidas >32% O₂.",
+    note: "Sirve en la ISS (21% de O₂), pero se restringe con más de 32% de O₂.",
   },
   {
     id: "ptfe",
@@ -113,7 +237,7 @@ const MATERIAL_PRESETS: MaterialPreset[] = [
     loi: 95,
     evaRated: true,
     baseSpread: 0.12,
-    note: "Estándar aeroespacial para aislamiento eléctrico en cabina y vacío.",
+    note: "Es el estándar aeroespacial para aislar cables en cabina y en vacío.",
   },
   {
     id: "nomex",
@@ -123,22 +247,73 @@ const MATERIAL_PRESETS: MaterialPreset[] = [
     loi: 36,
     evaRated: true,
     baseSpread: 0.08,
-    note: "Autoextinguible en traje EVA (4.3 psi · 100% O₂) bajo norma NASA-STD-6001B.",
+    note: "Se autoextingue en el traje EVA (0,29 atm y 100% de O₂), según NASA-STD-6001B.",
   },
 ];
 
 const ENV_PRESETS = [
-  { id: "iss", label: "ISS", o2: 21, psi: 14.7, g: 0 },
-  { id: "lunar", label: "Luna", o2: 32, psi: 8.2, g: 0.165 },
-  { id: "rover", label: "Rover", o2: 34, psi: 8.0, g: 0.165 },
-  { id: "mars", label: "Marte", o2: 21, psi: 14.7, g: 0.38 },
-  { id: "eva", label: "Traje EVA", o2: 100, psi: 4.3, g: 0 },
+  { id: "iss", short: "ISS", label: "ISS", o2: 21, psi: 14.7, g: 0 },
+  { id: "lunar", short: "Luna", label: "Luna", o2: 32, psi: 8.2, g: 0.165 },
+  { id: "rover", short: "Rover", label: "Rover", o2: 34, psi: 8.0, g: 0.165 },
+  { id: "mars", short: "Marte", label: "Marte", o2: 21, psi: 14.7, g: 0.38 },
+  { id: "eva", short: "EVA", label: "Traje EVA", o2: 100, psi: 4.3, g: 0 },
 ];
 
 const QUICK_QUESTIONS = [
-  "¿Es peligroso en Traje EVA?",
+  "¿Es peligroso en traje EVA?",
   "¿Cómo se apaga en 0g?",
+  "¿Qué material lo reemplaza?",
 ];
+
+/* ------------------------------------------------------------------ */
+/*  Semáforo del veredicto                                             */
+/* ------------------------------------------------------------------ */
+
+const VERDICT_META: Record<
+  SimulationInput["verdict"],
+  {
+    label: string;
+    box: Record<ThemeName, string>;
+    iconColor: Record<ThemeName, string>;
+    bar: string;
+    Icon: React.ElementType;
+  }
+> = {
+  PROHIBIDO: {
+    label: "No usar aquí",
+    box: {
+      dark: "bg-rose-950/50 border-rose-500/60 text-rose-100",
+      light: "bg-rose-50 border-rose-300 text-rose-900",
+    },
+    iconColor: { dark: "text-rose-400", light: "text-rose-600" },
+    bar: "bg-rose-500",
+    Icon: ShieldAlert,
+  },
+  RESTRINGIDO: {
+    label: "Usar con cuidado",
+    box: {
+      dark: "bg-amber-950/50 border-amber-500/60 text-amber-100",
+      light: "bg-amber-50 border-amber-300 text-amber-900",
+    },
+    iconColor: { dark: "text-amber-400", light: "text-amber-600" },
+    bar: "bg-amber-400",
+    Icon: AlertTriangle,
+  },
+  APROBADO: {
+    label: "Seguro",
+    box: {
+      dark: "bg-emerald-950/50 border-emerald-500/60 text-emerald-100",
+      light: "bg-emerald-50 border-emerald-300 text-emerald-900",
+    },
+    iconColor: { dark: "text-emerald-400", light: "text-emerald-600" },
+    bar: "bg-emerald-400",
+    Icon: ShieldCheck,
+  },
+};
+
+/* ------------------------------------------------------------------ */
+/*  Física del simulador (sin cambios)                                 */
+/* ------------------------------------------------------------------ */
 
 function computeSimulationPhysics(params: {
   preset: MaterialPreset;
@@ -172,10 +347,7 @@ function computeSimulationPhysics(params: {
   } else {
     const loiMargin = preset.loi - o2Percent;
     const rawRisk =
-      52 -
-      loiMargin * 1.45 +
-      (ppO2 - 3.09) * 9.5 +
-      diluentPenalty * 0.35;
+      52 - loiMargin * 1.45 + (ppO2 - 3.09) * 9.5 + diluentPenalty * 0.35;
     riskScore = Math.max(8, Math.min(99, Math.round(rawRisk)));
   }
 
@@ -192,7 +364,7 @@ function computeSimulationPhysics(params: {
     ).toFixed(2)
   );
 
-  let verdict: "APROBADO" | "RESTRINGIDO" | "PROHIBIDO" = "APROBADO";
+  let verdict: SimulationInput["verdict"] = "APROBADO";
   if (riskScore >= 65) verdict = "PROHIBIDO";
   else if (riskScore >= 36) verdict = "RESTRINGIDO";
 
@@ -210,176 +382,189 @@ function computeSimulationPhysics(params: {
   };
 }
 
+/* ------------------------------------------------------------------ */
+/*  Respuestas del modo Rápido (sin IA): prosa natural, sin etiquetas  */
+/* ------------------------------------------------------------------ */
+
 function buildFallbackSimulationReport(
   sim: SimulationInput,
   presetNote?: string
 ): string {
-  const ppO2 = ((sim.o2Percent / 100) * sim.pressurePsi).toFixed(2);
-  const gravLabel =
-    sim.gravityG === 0 ? "microgravedad (0g)" : `${sim.gravityG}g`;
+  const atm = toAtm(sim.pressurePsi);
+  const grav =
+    sim.gravityG === 0 ? "microgravedad" : `gravedad de ${sim.gravityG} g`;
 
-  return [
-    `- **Dictamen (${sim.verdict}):** En ${sim.environmentName} (${sim.o2Percent}% O₂, ${sim.pressurePsi} psi, ppO₂ ${ppO2} psi), **${sim.materialName}** propaga a **${sim.spreadMmPerSec} mm/s**.`,
-    `- **Por qué ocurre en ${gravLabel}:** ${
-      sim.o2Percent >= 30
-        ? "Sin nitrógeno suficiente para absorber calor, la llama acelera y se vuelve difícil de extinguir."
-        : "Atmósfera controlada; sin corrientes de aire forzado, la llama se limita por difusión."
-    }`,
-    `- **Recomendación NASA:** ${
-      presetNote ||
-      (sim.verdict === "PROHIBIDO"
-        ? "Reemplazar por textiles ignífugos certificados (Nomex/PBI) o cableado Teflón PTFE."
-        : "Permitido bajo control de configuración y sensores ópticos activos.")
-    }`,
-  ].join("\n");
+  const verdictText =
+    sim.verdict === "PROHIBIDO"
+      ? "Semáforo rojo, no uses este material aquí."
+      : sim.verdict === "RESTRINGIDO"
+      ? "Semáforo ámbar, úsalo solo con mucho cuidado."
+      : "Semáforo verde, es seguro en estas condiciones.";
+
+  const why =
+    sim.o2Percent >= 30
+      ? "Con tanto oxígeno la llama se acelera y cuesta apagarla."
+      : "Con este oxígeno la llama avanza despacio y se puede controlar.";
+
+  const alt =
+    presetNote ||
+    (sim.verdict === "PROHIBIDO"
+      ? "Es mejor cambiarlo por Nomex, PBI o teflón."
+      : "Puedes usarlo si hay detectores de humo activos.");
+
+  return `${verdictText} En ${grav}, con ${sim.o2Percent}% de O₂ a ${fmt(
+    atm
+  )} atm, la llama avanzaría a ${sim.spreadMmPerSec} mm/s. ${why} ${alt}`;
 }
 
-function renderInlineMarkdown(line: string): React.ReactNode[] {
-  const normalized = line.replace(/\*{1,2}$/, "");
-  const tokens = normalized.split(/(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)/g);
-
-  return tokens.map((part, i) => {
-    if (part.startsWith("**") && part.endsWith("**") && part.length > 4) {
-      return (
-        <strong key={i} className="font-semibold text-teal-200">
-          {part.slice(2, -2)}
-        </strong>
-      );
-    }
-    if (part.startsWith("*") && part.endsWith("*") && part.length > 2) {
-      return (
-        <em key={i} className="italic text-slate-100">
-          {part.slice(1, -1)}
-        </em>
-      );
-    }
-    if (part.startsWith("`") && part.endsWith("`") && part.length > 2) {
-      return (
-        <code
-          key={i}
-          className="px-1.5 py-0.5 rounded bg-slate-800 text-cyan-300 font-hud text-xs"
-        >
-          {part.slice(1, -1)}
-        </code>
-      );
-    }
-    return <React.Fragment key={i}>{part}</React.Fragment>;
-  });
-}
-
-function MarkdownMessage({ content }: { content: string }) {
-  const lines = content.split("\n");
-
-  return (
-    <div className="space-y-2 text-[13px] leading-relaxed text-slate-100">
-      {lines.map((rawLine, idx) => {
-        const line = rawLine.trim();
-        if (!line) return null;
-
-        const headingMatch = line.match(/^#{1,4}\s+(.*)$/);
-        if (headingMatch) {
-          return (
-            <p key={idx} className="font-semibold text-amber-300 text-xs">
-              {renderInlineMarkdown(headingMatch[1])}
-            </p>
-          );
-        }
-
-        const bulletMatch = line.match(/^[-*•]\s+(.*)$/);
-        if (bulletMatch) {
-          return (
-            <div key={idx} className="flex items-start gap-2">
-              <span className="text-teal-400 font-bold mt-0.5">•</span>
-              <span className="flex-1">{renderInlineMarkdown(bulletMatch[1])}</span>
-            </div>
-          );
-        }
-
-        return <p key={idx}>{renderInlineMarkdown(line)}</p>;
-      })}
-    </div>
-  );
-}
-
-function buildPsiRagReport(ctx: ContextOut, question?: string): string {
-  const { finding, environment, evidence } = ctx;
+function buildPsiRagReport(
+  ctx: ContextOut,
+  question?: string,
+  suitContext?: ContextOut
+): string {
+  const { finding, environment } = ctx;
   const o2Pct = Math.round(environment.o2_fraction * 100);
-  const psi = atmToPsi(environment.pressure_atm);
+  const atm = fmt(environment.pressure_atm);
   const isCritical = o2Pct >= 30;
-
-  const topFactor = finding.factors?.[0]
-    ? `${finding.factors[0].name} (+${finding.factors[0].contribution.toFixed(1)} pts)`
-    : `RPI ${finding.rpi}`;
+  const material = finding.material || "la muestra";
+  const where = `En ${environment.label}, con ${o2Pct}% de O₂ a ${atm} atm`;
 
   if (question) {
     const q = question.toLowerCase();
-    if (
-      q.includes("eva") ||
-      q.includes("traje") ||
-      q.includes("luna") ||
-      q.includes("peligro") ||
-      q.includes("usar")
-    ) {
-      return `- **Veredicto (${environment.label}):** ${
-        isCritical
-          ? `PELIGROSO / RESTRINGIDO a ${o2Pct}% O₂ (${psi} psi) para ${
-              finding.material || "este material"
-            }.`
-          : `RIESGO CONTROLADO a ${o2Pct}% O₂ (${psi} psi), sujeto a flujo nominal.`
-      }\n- **Factor clave:** ${topFactor} (${finding.observations} corridas PSI).`;
+
+    if (q.includes("reempl") || q.includes("sustit") || q.includes("alternativ")) {
+      return `Lo más seguro es cambiar ${material} por una tela que no arde, como Nomex o PBI, o por teflón en los cables. ${where}, esos materiales aguantan mucho mejor. ¿Quieres saber cómo se apagaría esta llama sin gravedad?`;
     }
+
     if (
       q.includes("apag") ||
       q.includes("supres") ||
       q.includes("preven") ||
       q.includes("mitig")
     ) {
-      return `- **Cómo mitigarlo:** Evitar ${
-        finding.material || "combustibles"
-      } en >30% O₂, diluir con CO₂ o He y asegurar evacuación < ${
-        environment.egress_s
-      } s.`;
+      return `Sin gravedad la llama no sube, así que lo primero es cortar el flujo de aire que la alimenta. Después se puede diluir el aire con dióxido de carbono o helio. La tripulación tendría unos ${environment.egress_s} segundos para salir. ¿Quieres saber qué material podría reemplazarlo?`;
     }
+
+    if (q.includes("eva") || q.includes("traje") || suitContext) {
+      if (suitContext) {
+        const suit = suitContext.finding;
+        const suitO2 = Math.round(suitContext.environment.o2_fraction * 100);
+        return `Dentro del traje espacial el aire tiene ${suitO2}% de O₂ a ${fmt(
+          suitContext.environment.pressure_atm
+        )} atm. Para este mismo experimento el riesgo allí es ${suit.rpi} de 100, y en ${
+          environment.label
+        } es ${finding.rpi} de 100. ${
+          suit.rpi > finding.rpi
+            ? "En el traje sería más peligroso."
+            : "El riesgo calculado en el traje no es mayor."
+        } ¿Quieres saber qué material podría reemplazarlo?`;
+      }
+      return `Dentro de un traje espacial el aire es oxígeno puro, así que ${material} ardería con mucha más facilidad que en ${environment.label}. Por eso los trajes solo usan telas que no arden. ¿Quieres saber qué material podría reemplazarlo?`;
+    }
+
+    if (q.includes("luna") || q.includes("peligro") || q.includes("usar")) {
+      return `${where}, ${
+        isCritical
+          ? `${material} es peligroso, porque con tanto oxígeno arde con facilidad.`
+          : `${material} tiene un riesgo moderado si el aire circula con normalidad.`
+      } ¿Quieres saber qué material podría reemplazarlo?`;
+    }
+
+    return `De ${finding.experiment} tengo ${finding.observations} corridas con ${material}. ${where}, el nivel de riesgo es ${finding.band}, ${finding.rpi} de 100. ¿Quieres saber qué material podría reemplazarlo?`;
   }
 
-  return [
-    `- **Dato PSI:** ${finding.narrative}`,
-    `- **Riesgo en ${environment.label} (${o2Pct}% O₂):** ${
-      isCritical
-        ? `Atmósfera enriquecida crítica; ${
-            finding.material || "el material"
-          } acelera su ignición (${topFactor}).`
-        : `Condición nominal (${topFactor}); vigilar acumulación local de O₂.`
-    }`,
-    `- **Prevención:** Usar textiles ignífugos (Nomex/PBI) o dilución CO₂/He (${evidence.length} filas CSV).`,
-  ].join("\n");
+  return `En el experimento ${finding.experiment} se probó ${material} en ${
+    finding.observations
+  } corridas. ${where}, ${
+    isCritical
+      ? "ardería con más facilidad y la llama avanzaría más rápido."
+      : "el riesgo es moderado, pero hay que vigilar que el oxígeno no se acumule."
+  } Lo más seguro es usar telas que no arden, como Nomex o PBI. ¿Quieres saber cómo se apagaría esta llama sin gravedad?`;
 }
 
+/* ------------------------------------------------------------------ */
+/*  Presentación                                                       */
+/* ------------------------------------------------------------------ */
+
+function Answer({ text }: { text: string }) {
+  const parts = text
+    .split(/\n+/)
+    .map((p) => p.trim())
+    .filter(Boolean);
+
+  return (
+    <div className="space-y-1.5 text-[13px] leading-snug">
+      {parts.map((part, i) => (
+        <p key={i}>{part}</p>
+      ))}
+    </div>
+  );
+}
+
+/* Botón de icono pequeño, reutilizado en cabecera y pie */
+function IconBtn(props: {
+  label: string;
+  active?: boolean;
+  disabled?: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  const { label, active, disabled, onClick, children } = props;
+  const t = useContext(ThemeCtx);
+  return (
+    <button
+      type="button"
+      title={label}
+      aria-label={label}
+      aria-pressed={active}
+      disabled={disabled}
+      onClick={onClick}
+      className={`inline-flex h-7 min-w-7 cursor-pointer items-center justify-center gap-1 rounded-lg border px-1.5 font-hud text-[11px] transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 disabled:opacity-40 ${
+        active ? t.iconBtnActive : t.iconBtn
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/*  Componente principal                                               */
+/* ------------------------------------------------------------------ */
+
 export function FlameyWidget({ activeFinding, environmentKey }: Props) {
-  const [open, setOpen] = useState(true);
-  const [tab, setTab] = useState<"finding" | "sim" | "rules">("finding");
-  const [showEngineBar, setShowEngineBar] = useState(false);
-  const [showCsvEvidence, setShowCsvEvidence] = useState(false);
+  const [open, setOpen] = useState(false);
+  const [tab, setTab] = useState<"finding" | "sim">("finding");
+  const [themeName, setThemeName] = useState<ThemeName>("dark");
+  const [showSettings, setShowSettings] = useState(false);
+  const [showSources, setShowSources] = useState(false);
+  const [showRule, setShowRule] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
+  const [showWhy, setShowWhy] = useState(false);
 
   const [context, setContext] = useState<ContextOut | null>(null);
+  const [loadingCtx, setLoadingCtx] = useState(false);
   const [rules, setRules] = useState<RulesOut | null>(null);
+  const [ruleIdx, setRuleIdx] = useState(0);
 
   // Voz
   const [voiceEnabled, setVoiceEnabled] = useState(false);
   const [voiceAvailable, setVoiceAvailable] = useState(false);
 
-  // Modelos locales vs PSI-RAG
+  // Motor: PSI-RAG (instantáneo) o modelo local de Ollama
   const [models, setModels] = useState<string[]>([]);
   const [selectedModel, setSelectedModel] = useState<string>(RAG_MODE);
   const [scanning, setScanning] = useState(false);
   const [modelReady, setModelReady] = useState(true);
   const [loadingModel, setLoadingModel] = useState(false);
 
-  const [aiExplanation, setAiExplanation] = useState("");
+  // Chat
+  const [messages, setMessages] = useState<ChatMsg[]>([]);
+  const [draft, setDraft] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [question, setQuestion] = useState("");
 
-  // Simulador interactivo
+  // Simulador
   const [selectedPresetId, setSelectedPresetId] = useState<string>("cotton");
   const [customMaterial, setCustomMaterial] = useState<string>("");
   const [simO2, setSimO2] = useState<number>(100);
@@ -392,6 +577,13 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
   const warmupAbortRef = useRef<AbortController | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
   const voiceEnabledRef = useRef(voiceEnabled);
+  const selectedModelRef = useRef(selectedModel);
+  const modelReadyRef = useRef(modelReady);
+  const lastInputRef = useRef(0);
+  const lastEnvChangeRef = useRef(0);
+  const listRef = useRef<HTMLDivElement | null>(null);
+
+  const t = THEMES[themeName];
 
   const currentPreset = useMemo(
     () =>
@@ -399,6 +591,8 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
       MATERIAL_PRESETS[0],
     [selectedPresetId]
   );
+
+  const isCustomMaterial = customMaterial.trim().length > 0;
 
   const simResult = useMemo(
     () =>
@@ -413,6 +607,66 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
     [currentPreset, customMaterial, simO2, simPsi, simGravity, simEnvName]
   );
 
+  const simFallback = useMemo(
+    () =>
+      buildFallbackSimulationReport(
+        simResult,
+        isCustomMaterial ? undefined : currentPreset.note
+      ),
+    [simResult, isCustomMaterial, currentPreset.note]
+  );
+
+  const simText = simAnalysis || simFallback;
+  const lastFlameyText =
+    [...messages].reverse().find((m) => m.role === "flamey")?.text || "";
+
+  /* ---------------- Tema ---------------- */
+
+  // Se lee en un efecto (no en el estado inicial) para no romper el prerender.
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem(THEME_STORAGE_KEY);
+      if (saved === "light" || saved === "dark") setThemeName(saved);
+    } catch {
+      // Sin acceso a localStorage: se queda en oscuro
+    }
+  }, []);
+
+  const toggleTheme = () => {
+    const next: ThemeName = themeName === "dark" ? "light" : "dark";
+    setThemeName(next);
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, next);
+    } catch {
+      // Ignorar
+    }
+  };
+
+  /* ---------------- Refs al día ---------------- */
+
+  useEffect(() => {
+    selectedModelRef.current = selectedModel;
+    modelReadyRef.current = modelReady;
+  }, [selectedModel, modelReady]);
+
+  // Registra el último clic o Enter para saber si un cambio lo pidió la persona.
+  useEffect(() => {
+    const mark = () => {
+      lastInputRef.current = performance.now();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Enter" || e.key === " ") mark();
+    };
+    window.addEventListener("pointerdown", mark, true);
+    window.addEventListener("keydown", onKey, true);
+    return () => {
+      window.removeEventListener("pointerdown", mark, true);
+      window.removeEventListener("keydown", onKey, true);
+    };
+  }, []);
+
+  /* ---------------- Voz ---------------- */
+
   useEffect(() => {
     voiceEnabledRef.current = voiceEnabled;
     if (!voiceEnabled) stopVoice();
@@ -424,17 +678,18 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
   }, []);
 
   const toggleVoice = () => {
-    setVoiceEnabled((prev) => {
-      const next = !prev;
-      if (next) {
-        if (tab === "sim") speakSimulationVerdict(simResult);
-        else if (context) speakFindingAlert(context);
-      } else {
-        stopVoice();
-      }
-      return next;
-    });
+    const next = !voiceEnabled;
+    setVoiceEnabled(next);
+
+    if (!next) {
+      stopVoice();
+      return;
+    }
+    if (tab === "sim") speakText(simText);
+    else if (lastFlameyText) speakText(lastFlameyText);
   };
+
+  /* ---------------- Modelos locales ---------------- */
 
   const scanLocalModels = useCallback(async () => {
     setScanning(true);
@@ -457,14 +712,23 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
 
   useEffect(() => {
     scanLocalModels();
-    api.rules().then(setRules).catch(() => {});
+    api
+      .rules()
+      .then((data) => {
+        setRules(data);
+        // Empieza en un dato distinto cada visita (aquí sí se permite Math.random).
+        const total = data.rules?.length || 0;
+        if (total > 0) setRuleIdx(Math.floor(Math.random() * total));
+      })
+      .catch(() => {});
   }, [scanLocalModels]);
 
-  // Cambiar entre PSI-RAG y modelos locales de GPU
   useEffect(() => {
     streamAbortRef.current?.abort();
     warmupAbortRef.current?.abort();
     stopVoice();
+    setStreaming(false);
+    setDraft("");
 
     if (selectedModel === RAG_MODE) {
       if (prevModelRef.current && prevModelRef.current !== RAG_MODE) {
@@ -473,7 +737,6 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
       prevModelRef.current = RAG_MODE;
       setLoadingModel(false);
       setModelReady(true);
-      setStreaming(false);
       return;
     }
 
@@ -482,8 +745,6 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
 
     setModelReady(false);
     setLoadingModel(true);
-    setStreaming(false);
-    setAiExplanation("");
 
     const switchModel = async () => {
       if (
@@ -506,148 +767,115 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
     return () => controller.abort();
   }, [selectedModel]);
 
-  // Cargar análisis puntual de hallazgo PSI
-  useEffect(() => {
-    if (!activeFinding) return;
-    let cancelled = false;
+  /* ---------------- Chat: generar una respuesta ---------------- */
 
-    stopVoice();
-    setOpen(true);
-    setTab("finding");
-    setAiExplanation("");
+  const cancelStream = useCallback(() => {
+    streamAbortRef.current?.abort();
+    setStreaming(false);
+    setDraft("");
+  }, []);
 
-    api
-      .findingContext(activeFinding.key, environmentKey)
-      .then((ctx) => {
-        if (cancelled) return;
-        setContext(ctx);
-
-        if (voiceEnabledRef.current) {
-          speakFindingAlert(ctx);
-        }
-
-        if (selectedModel === RAG_MODE || !modelReady) {
-          setAiExplanation(buildPsiRagReport(ctx));
-          return;
-        }
-
-        streamAbortRef.current?.abort();
-        const controller = new AbortController();
-        streamAbortRef.current = controller;
-
-        setStreaming(true);
-        askOllamaStream({
-          model: selectedModel,
-          context: ctx,
-          signal: controller.signal,
-          onToken: (text) => setAiExplanation(text),
-        })
-          .catch((err) => {
-            if (err?.name !== "AbortError") {
-              setAiExplanation(buildPsiRagReport(ctx));
-            }
-          })
-          .finally(() => {
-            if (!controller.signal.aborted) setStreaming(false);
-          });
-      })
-      .catch(() => {});
-
-    return () => {
-      cancelled = true;
+  /**
+   * Genera una respuesta de Flamey y la añade al chat.
+   * Sin `q` explica el experimento; con `q` responde usando el historial.
+   */
+  const generate = useCallback(
+    async (ctx: ContextOut, q: string | undefined, history: ChatMsg[]) => {
+      stopVoice();
       streamAbortRef.current?.abort();
-    };
-  }, [activeFinding, environmentKey, modelReady, selectedModel]);
 
-  // Evaluación automática en vivo cuando el usuario cambia material u O2 en el Simulador
-  useEffect(() => {
-    if (tab !== "sim") return;
+      const controller = new AbortController();
+      streamAbortRef.current = controller;
+      setDraft("");
+      setStreaming(true);
 
-    const fallbackReport = buildFallbackSimulationReport(
-      simResult,
-      customMaterial.trim() ? undefined : currentPreset.note
-    );
-    setSimAnalysis(fallbackReport);
+      const deliver = (text: string) => {
+        setMessages((m) => [...m, { role: "flamey", text }]);
+        setDraft("");
+        setStreaming(false);
+        if (voiceEnabledRef.current) speakText(text);
+      };
 
-    const timer = setTimeout(() => {
-      if (voiceEnabledRef.current) {
-        speakSimulationVerdict(simResult);
+      // Un "sí" responde a la última pregunta que hizo Flamey.
+      const lastFlamey =
+        [...history].reverse().find((m) => m.role === "flamey")?.text || "";
+      const saidYes = !!q && AFFIRMATIVE.test(q);
+
+      const asksSuit =
+        !!q &&
+        (/\beva\b|traje/i.test(q) ||
+          (saidYes && /traje espacial\?/i.test(lastFlamey)));
+
+      // Mismo experimento, evaluado en el traje: dato real de la API.
+      let suitContext: ContextOut | undefined;
+      if (asksSuit && ctx.environment.key !== SUIT_ENV_KEY) {
+        try {
+          suitContext = await api.findingContext(ctx.finding.key, SUIT_ENV_KEY);
+        } catch {
+          suitContext = undefined;
+        }
+        if (controller.signal.aborted) return;
       }
 
-      if (selectedModel === RAG_MODE || !modelReady) {
+      // Para el modo Rápido, un "sí" se traduce al tema que Flamey ofreció.
+      let ragQuestion = q;
+      if (saidYes) {
+        if (asksSuit) ragQuestion = "traje";
+        else if (/apagar[ií]a/i.test(lastFlamey)) ragQuestion = "apagar";
+        else if (/reemplazar/i.test(lastFlamey)) ragQuestion = "reemplazo";
+      }
+      const fallback = () => buildPsiRagReport(ctx, ragQuestion, suitContext);
+
+      const model = selectedModelRef.current;
+      const useLocal = model !== RAG_MODE && modelReadyRef.current;
+
+      if (!useLocal) {
+        deliver(fallback());
         return;
       }
 
-      streamAbortRef.current?.abort();
-      const controller = new AbortController();
-      streamAbortRef.current = controller;
-
-      setStreaming(true);
-      askMaterialSimulationStream({
-        model: selectedModel,
-        sim: simResult,
-        signal: controller.signal,
-        onToken: (text) => setSimAnalysis(text),
-      })
-        .catch((err) => {
-          if ((err as Error)?.name !== "AbortError") {
-            setSimAnalysis(fallbackReport);
-          }
-        })
-        .finally(() => {
-          if (!controller.signal.aborted) setStreaming(false);
+      let finalReply = "";
+      try {
+        await askOllamaStream({
+          model,
+          context: ctx,
+          userQuestion: q,
+          suitContext,
+          history: history.slice(-HISTORY_TURNS).map((m) => ({
+            role: m.role === "user" ? ("user" as const) : ("assistant" as const),
+            content: m.text,
+          })),
+          signal: controller.signal,
+          onToken: (text) => {
+            finalReply = text;
+            setDraft(text);
+          },
         });
-    }, 450);
-
-    return () => {
-      clearTimeout(timer);
-      streamAbortRef.current?.abort();
-    };
-  }, [tab, simResult, customMaterial, currentPreset.note, selectedModel, modelReady]);
-
-  const submitQuestion = async (rawQuestion: string) => {
-    const q = rawQuestion.trim();
-    if (!q || !context) return;
-
-    stopVoice();
-    setQuestion("");
-
-    if (selectedModel === RAG_MODE || !modelReady) {
-      const answer = buildPsiRagReport(context, q);
-      setAiExplanation(answer);
-      if (voiceEnabledRef.current) speakShortReply(answer);
-      return;
-    }
-
-    streamAbortRef.current?.abort();
-    const controller = new AbortController();
-    streamAbortRef.current = controller;
-
-    let finalReply = "";
-    setAiExplanation("");
-    setStreaming(true);
-
-    try {
-      await askOllamaStream({
-        model: selectedModel,
-        context,
-        userQuestion: q,
-        signal: controller.signal,
-        onToken: (text) => {
-          finalReply = text;
-          setAiExplanation(text);
-        },
-      });
-      if (!controller.signal.aborted && voiceEnabledRef.current && finalReply) {
-        speakShortReply(finalReply);
+      } catch {
+        if (controller.signal.aborted) return;
+        finalReply = "";
       }
-    } catch {
-      const fallback = buildPsiRagReport(context, q);
-      setAiExplanation(fallback);
-      if (voiceEnabledRef.current) speakShortReply(fallback);
-    } finally {
-      if (!controller.signal.aborted) setStreaming(false);
-    }
+
+      if (controller.signal.aborted) return;
+      deliver(finalReply.trim() || fallback());
+    },
+    []
+  );
+
+  const explainCurrent = () => {
+    if (!context) return;
+    setMessages([]);
+    generate(context, undefined, []);
+  };
+
+  const submitQuestion = (rawQuestion: string) => {
+    const q = rawQuestion.trim();
+    if (!q || !context || streaming) return;
+
+    const history = messages;
+    setQuestion("");
+    setMessages((m) => [...m, { role: "user", text: q }]);
+    generate(context, q, history);
   };
 
   const handleAskSubmit = (e: React.FormEvent) => {
@@ -655,532 +883,698 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
     submitQuestion(question);
   };
 
+  const clearChat = () => {
+    stopVoice();
+    cancelStream();
+    setMessages([]);
+  };
+
+  /* ---------------- Experimento seleccionado ---------------- */
+
+  // Va antes del efecto del experimento: si cambian a la vez, gana "automático".
+  useEffect(() => {
+    lastEnvChangeRef.current = performance.now();
+  }, [environmentKey]);
+
+  useEffect(() => {
+    if (!activeFinding) return;
+    let cancelled = false;
+
+    // ¿Lo pidió la persona con un clic, o lo puso la página por su cuenta?
+    const lastInput = lastInputRef.current;
+    const explicit =
+      performance.now() - lastInput < EXPLICIT_WINDOW_MS &&
+      lastInput > lastEnvChangeRef.current;
+
+    stopVoice();
+    streamAbortRef.current?.abort();
+    setStreaming(false);
+    setDraft("");
+    setMessages([]);
+    setContext(null);
+    setLoadingCtx(true);
+
+    if (explicit) {
+      setOpen(true);
+      setTab("finding");
+    }
+
+    api
+      .findingContext(activeFinding.key, environmentKey)
+      .then((ctx) => {
+        if (cancelled) return;
+        setContext(ctx);
+        // Solo explica de inmediato si se pidió. Si no, espera.
+        if (explicit) generate(ctx, undefined, []);
+      })
+      .catch(() => {})
+      .finally(() => {
+        if (!cancelled) setLoadingCtx(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activeFinding, environmentKey, generate]);
+
+  // Mantiene el chat pegado al último mensaje.
+  useEffect(() => {
+    const el = listRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [messages, draft, streaming]);
+
+  /* ---------------- Simulador en vivo ---------------- */
+
+  useEffect(() => {
+    if (tab !== "sim") return;
+
+    setSimAnalysis(simFallback);
+
+    const timer = setTimeout(() => {
+      if (selectedModel === RAG_MODE || !modelReady) {
+        if (voiceEnabledRef.current) speakSimulationVerdict(simResult);
+        return;
+      }
+
+      streamAbortRef.current?.abort();
+      const controller = new AbortController();
+      streamAbortRef.current = controller;
+
+      let finalSimReply = "";
+      setStreaming(true);
+      askMaterialSimulationStream({
+        model: selectedModel,
+        sim: simResult,
+        signal: controller.signal,
+        onToken: (text) => {
+          finalSimReply = text;
+          setSimAnalysis(text);
+        },
+      })
+        .then(() => {
+          if (!controller.signal.aborted && voiceEnabledRef.current && finalSimReply) {
+            speakText(finalSimReply);
+          }
+        })
+        .catch((err) => {
+          if ((err as Error)?.name !== "AbortError") {
+            setSimAnalysis(simFallback);
+            if (voiceEnabledRef.current) speakSimulationVerdict(simResult);
+          }
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setStreaming(false);
+        });
+    }, 850);
+
+    return () => {
+      clearTimeout(timer);
+      streamAbortRef.current?.abort();
+      setStreaming(false);
+    };
+  }, [tab, simResult, simFallback, selectedModel, modelReady]);
+
+  /* ---------------- Vista minimizada ---------------- */
+
   if (!open) {
     return (
       <button
         type="button"
         onClick={() => setOpen(true)}
         aria-label="Abrir asistente Flamey"
-        className="fixed left-16 bottom-5 z-30 flex items-center gap-2.5 px-4 py-2.5 rounded-full bg-slate-950/95 border border-teal-400/60 text-teal-200 shadow-2xl hover:scale-105 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 transition cursor-pointer"
+        className={`fixed bottom-5 left-16 z-30 flex cursor-pointer items-center gap-2 rounded-full border px-3.5 py-2 shadow-2xl transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${t.pill}`}
       >
-        <Flame className="w-4 h-4 text-orange-400" />
+        <Flame className="h-4 w-4 text-orange-500" />
         <span className="font-hud text-xs font-bold tracking-wide">FLAMEY</span>
+        <ChevronUp className={`h-3.5 w-3.5 ${t.muted}`} />
       </button>
     );
   }
 
   const isLocalModel = selectedModel !== RAG_MODE;
   const canAsk = !isLocalModel || modelReady;
-  const shortModelName =
-    selectedModel === RAG_MODE ? "PSI-RAG" : selectedModel.split(":")[0];
+  const shortModelName = selectedModel.split(":")[0];
+  const meta = VERDICT_META[simResult.verdict];
+  const VerdictIcon = meta.Icon;
+  const currentRule = rules?.rules?.length
+    ? rules.rules[ruleIdx % rules.rules.length]
+    : null;
+  const chatStarted = messages.length > 0 || (tab === "finding" && streaming);
+
+  const statusDot = loadingModel
+    ? "bg-amber-400 animate-pulse"
+    : isLocalModel
+    ? "bg-emerald-500"
+    : "bg-teal-500";
+  const statusTitle = loadingModel
+    ? `Cargando ${shortModelName}...`
+    : modelLabel(selectedModel);
+
+  /* ---------------- Vista abierta ---------------- */
 
   return (
-    <aside
-      aria-label="Asistente de seguridad contra incendios Flamey"
-      className="fixed left-16 bottom-5 z-30 w-[370px] sm:w-[440px] rounded-2xl bg-slate-950/95 backdrop-blur-xl border border-slate-800 shadow-2xl p-4"
-    >
-      {/* 1. CABECERA LIMPIA */}
-      <div className="flex items-center justify-between gap-2">
-        <div className="flex items-center gap-2.5 min-w-0">
-          <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-cyan-400 via-teal-500 to-orange-500 flex items-center justify-center shadow-md shrink-0">
-            <Flame className="w-5 h-5 text-slate-950 fill-slate-950" />
+    <ThemeCtx.Provider value={t}>
+      <aside
+        aria-label="Asistente de seguridad contra incendios Flamey"
+        className={`fixed bottom-5 left-16 z-30 flex max-h-[70vh] w-[320px] flex-col overflow-hidden rounded-2xl border shadow-2xl backdrop-blur-xl ${t.panel}`}
+      >
+        {/* CABECERA */}
+        <div
+          className={`flex shrink-0 items-center justify-between gap-2 border-b px-3 py-2 ${t.divider}`}
+        >
+          <div className="flex min-w-0 items-center gap-2">
+            <Flame className="h-4 w-4 shrink-0 text-orange-500" />
+            <h2 className={`font-hud text-xs font-bold tracking-wider ${t.title}`}>
+              FLAMEY
+            </h2>
+            <span
+              title={statusTitle}
+              aria-label={statusTitle}
+              className={`h-2 w-2 shrink-0 rounded-full ${statusDot}`}
+            />
           </div>
-          <div className="min-w-0">
-            <div className="flex items-center gap-2">
-              <h2 className="font-hud text-xs font-bold tracking-wider text-white">
-                FLAMEY SI
-              </h2>
-              <span
-                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full font-hud text-[11px] ${
-                  isLocalModel
-                    ? "bg-emerald-500/15 text-emerald-300 border border-emerald-500/40"
-                    : "bg-teal-500/15 text-teal-300 border border-teal-500/40"
-                }`}
+
+          <div className="flex shrink-0 items-center gap-1">
+            {voiceAvailable && (
+              <IconBtn
+                label={voiceEnabled ? "Desactivar voz" : "Activar voz"}
+                active={voiceEnabled}
+                onClick={toggleVoice}
               >
-                {loadingModel ? "Cargando..." : shortModelName}
-              </span>
-            </div>
-            <p className="text-xs text-slate-300 truncate mt-0.5">
-              {tab === "sim"
-                ? `${simEnvName} · ${simO2}% O₂ (${simPsi} psi)`
-                : context
-                ? `${context.finding.experiment} · ${context.environment.label}`
-                : "Selecciona un hallazgo o abre el simulador"}
-            </p>
+                {voiceEnabled ? (
+                  <Volume2 className="h-3.5 w-3.5" />
+                ) : (
+                  <VolumeX className="h-3.5 w-3.5" />
+                )}
+              </IconBtn>
+            )}
+            <IconBtn
+              label={themeName === "dark" ? "Cambiar a modo claro" : "Cambiar a modo oscuro"}
+              onClick={toggleTheme}
+            >
+              {themeName === "dark" ? (
+                <Sun className="h-3.5 w-3.5" />
+              ) : (
+                <Moon className="h-3.5 w-3.5" />
+              )}
+            </IconBtn>
+            <IconBtn
+              label="Elegir motor de IA"
+              active={showSettings}
+              onClick={() => setShowSettings((v) => !v)}
+            >
+              <Settings className="h-3.5 w-3.5" />
+            </IconBtn>
+            <IconBtn
+              label="Minimizar Flamey"
+              onClick={() => {
+                stopVoice();
+                setOpen(false);
+              }}
+            >
+              <ChevronDown className="h-4 w-4" />
+            </IconBtn>
           </div>
         </div>
 
-        {/* Controles esenciales: Voz, Motor IA y Minimizar */}
-        <div className="flex items-center gap-1.5 shrink-0">
-          {voiceAvailable && (
+        {/* MOTOR DE IA (oculto por defecto) */}
+        {showSettings && (
+          <div
+            className={`flex shrink-0 items-center gap-1.5 border-b px-3 py-2 ${t.divider}`}
+          >
+            <label htmlFor="flamey-model-select" className="sr-only">
+              Motor de IA
+            </label>
+            <select
+              id="flamey-model-select"
+              value={selectedModel}
+              onChange={(e) => setSelectedModel(e.target.value)}
+              className={`h-7 min-w-0 flex-1 cursor-pointer rounded-lg border px-2 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${t.modelSelect}`}
+            >
+              <option value={RAG_MODE}>{modelLabel(RAG_MODE)}</option>
+              {models.map((m) => (
+                <option key={m} value={m}>
+                  {modelLabel(m)}
+                </option>
+              ))}
+            </select>
+            <IconBtn
+              label="Buscar modelos en Ollama"
+              disabled={scanning}
+              onClick={scanLocalModels}
+            >
+              <RefreshCw className={`h-3.5 w-3.5 ${scanning ? "animate-spin" : ""}`} />
+            </IconBtn>
+          </div>
+        )}
+
+        {/* PESTAÑAS */}
+        <div
+          role="tablist"
+          aria-label="Secciones de Flamey"
+          className={`grid shrink-0 grid-cols-2 border-b ${t.divider}`}
+        >
+          {(
+            [
+              { id: "finding", label: "Chat", Icon: MessageCircle },
+              { id: "sim", label: "Simular", Icon: Sliders },
+            ] as const
+          ).map(({ id, label, Icon }) => (
             <button
+              key={id}
               type="button"
-              onClick={toggleVoice}
-              aria-pressed={voiceEnabled}
-              aria-label={voiceEnabled ? "Desactivar voz" : "Activar voz"}
-              className={`inline-flex items-center gap-1.5 min-h-[34px] px-2.5 rounded-lg border font-hud text-xs transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 cursor-pointer ${
-                voiceEnabled
-                  ? "bg-teal-500/25 border-teal-400 text-teal-100"
-                  : "bg-slate-900 border-slate-700 text-slate-300 hover:text-white"
+              role="tab"
+              aria-selected={tab === id}
+              onClick={() => {
+                if (tab === id) return;
+                stopVoice();
+                cancelStream();
+                setTab(id);
+              }}
+              className={`flex h-8 cursor-pointer items-center justify-center gap-1.5 border-b-2 font-hud text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-teal-400 ${
+                tab === id ? t.tabOn : t.tabOff
               }`}
             >
-              {voiceEnabled ? (
-                <Volume2 className="w-3.5 h-3.5 text-teal-300" />
-              ) : (
-                <VolumeX className="w-3.5 h-3.5" />
-              )}
-              <span>Voz</span>
+              <Icon className="h-3.5 w-3.5" />
+              {label}
             </button>
-          )}
-
-          <button
-            type="button"
-            onClick={() => setShowEngineBar((v) => !v)}
-            aria-expanded={showEngineBar}
-            aria-label="Configurar motor de IA"
-            title="Cambiar modelo local o modo PSI-RAG"
-            className={`min-h-[34px] px-2 rounded-lg border transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 cursor-pointer ${
-              showEngineBar
-                ? "bg-slate-800 border-emerald-400/60 text-emerald-300"
-                : "bg-slate-900 border-slate-700 text-slate-300 hover:text-white"
-            }`}
-          >
-            <Cpu className="w-3.5 h-3.5" />
-          </button>
-
-          <button
-            type="button"
-            onClick={() => {
-              stopVoice();
-              setOpen(false);
-            }}
-            aria-label="Minimizar Flamey"
-            className="min-h-[34px] px-2 rounded-lg bg-slate-900 border border-slate-800 text-slate-400 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 cursor-pointer"
-          >
-            <ChevronDown className="w-4 h-4" />
-          </button>
+          ))}
         </div>
-      </div>
 
-      {/* Barra plegable de selección de motor IA (solo visible si el usuario la abre) */}
-      {showEngineBar && (
-        <div className="mt-2.5 p-2 rounded-xl bg-slate-900 border border-slate-800 flex items-center gap-2">
-          <label htmlFor="flamey-model-select" className="font-hud text-xs text-slate-300 shrink-0">
-            Motor IA:
-          </label>
-          <select
-            id="flamey-model-select"
-            value={selectedModel}
-            onChange={(e) => setSelectedModel(e.target.value)}
-            className="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs text-emerald-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 cursor-pointer"
-          >
-            {models.map((m) => (
-              <option key={m} value={m}>
-                {m} (GPU Local)
-              </option>
-            ))}
-            <option value={RAG_MODE}>PSI-RAG (Instantáneo sin GPU)</option>
-          </select>
-          <button
-            type="button"
-            onClick={scanLocalModels}
-            disabled={scanning}
-            aria-label="Buscar modelos locales en Ollama"
-            className="p-1.5 rounded-lg bg-slate-950 border border-slate-700 text-slate-200 hover:border-teal-400 cursor-pointer"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${scanning ? "animate-spin" : ""}`} />
-          </button>
-        </div>
-      )}
-
-      {/* 2. PESTAÑAS PRINCIPALES DE NAVEGACIÓN */}
-      <div
-        role="tablist"
-        aria-label="Secciones de Flamey"
-        className="grid grid-cols-3 gap-1.5 mt-3 p-1 rounded-xl bg-slate-900 border border-slate-800"
-      >
-        <button
-          type="button"
-          role="tab"
-          aria-selected={tab === "finding"}
-          onClick={() => setTab("finding")}
-          className={`flex items-center justify-center gap-1.5 py-2 rounded-lg font-hud text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 cursor-pointer ${
-            tab === "finding"
-              ? "bg-teal-500 text-slate-950 shadow"
-              : "text-slate-300 hover:text-white"
-          }`}
-        >
-          <Sparkles className="w-3.5 h-3.5" />
-          <span>Análisis PSI</span>
-        </button>
-
-        <button
-          type="button"
-          role="tab"
-          aria-selected={tab === "sim"}
-          onClick={() => setTab("sim")}
-          className={`flex items-center justify-center gap-1.5 py-2 rounded-lg font-hud text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 cursor-pointer ${
-            tab === "sim"
-              ? "bg-cyan-400 text-slate-950 shadow"
-              : "text-slate-300 hover:text-white"
-          }`}
-        >
-          <Sliders className="w-3.5 h-3.5" />
-          <span>Simulador O₂</span>
-        </button>
-
-        <button
-          type="button"
-          role="tab"
-          aria-selected={tab === "rules"}
-          onClick={() => setTab("rules")}
-          className={`flex items-center justify-center gap-1.5 py-2 rounded-lg font-hud text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 cursor-pointer ${
-            tab === "rules"
-              ? "bg-amber-400 text-slate-950 shadow"
-              : "text-slate-300 hover:text-white"
-          }`}
-        >
-          <BookOpen className="w-3.5 h-3.5" />
-          <span>Reglas NASA</span>
-        </button>
-      </div>
-
-      {/* 3. CONTENIDO DE PESTAÑA 1: ANÁLISIS PSI + PREGUNTA RÁPIDA */}
-      {tab === "finding" && (
-        <div role="tabpanel" className="mt-3 space-y-2.5">
-          {context ? (
-            <>
-              <div
-                aria-live="polite"
-                className="max-h-52 overflow-y-auto bg-slate-900/95 p-3 rounded-xl border border-slate-800"
-              >
-                {isLocalModel && loadingModel ? (
-                  <div className="flex items-center gap-2 text-xs text-amber-300 font-hud py-2">
-                    <Loader2 className="w-4 h-4 animate-spin shrink-0" />
-                    <span>Preparando {shortModelName} en tu GPU...</span>
-                  </div>
-                ) : (
-                  <>
-                    <MarkdownMessage
-                      content={aiExplanation || buildPsiRagReport(context)}
-                    />
-                    {streaming && (
-                      <span className="inline-block w-1.5 h-3.5 ml-1 bg-teal-400 animate-pulse align-middle" />
-                    )}
-                  </>
-                )}
-              </div>
-
-              {/* Preguntas de 1 clic + campo libre */}
-              <div className="flex flex-wrap gap-1.5">
-                {QUICK_QUESTIONS.map((qText) => (
-                  <button
-                    key={qText}
-                    type="button"
-                    disabled={!canAsk || streaming}
-                    onClick={() => submitQuestion(qText)}
-                    className="px-2.5 py-1 rounded-full bg-slate-900 hover:bg-slate-800 border border-slate-700 text-xs text-teal-200 disabled:opacity-40 cursor-pointer"
-                  >
-                    {qText}
-                  </button>
-                ))}
-              </div>
-
-              <form onSubmit={handleAskSubmit} className="flex gap-1.5">
-                <label htmlFor="flamey-ask-input" className="sr-only">
-                  Pregunta sobre este experimento
-                </label>
-                <input
-                  id="flamey-ask-input"
-                  type="text"
-                  value={question}
-                  disabled={!canAsk}
-                  onChange={(e) => setQuestion(e.target.value)}
-                  placeholder="Haz una pregunta puntual..."
-                  className="flex-1 min-h-[36px] bg-slate-900 border border-slate-700 rounded-xl px-3 text-xs text-white placeholder:text-slate-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 disabled:opacity-50"
-                />
-                <button
-                  type="submit"
-                  disabled={!canAsk || streaming || !question.trim()}
-                  aria-label="Enviar pregunta"
-                  className="min-h-[36px] px-3 rounded-xl bg-teal-500 text-slate-950 font-semibold hover:bg-teal-400 disabled:opacity-40 cursor-pointer"
+        {/* CUERPO */}
+        <div className="min-h-0 flex-1 overflow-y-auto p-3">
+          {/* ============ CHAT ============ */}
+          {tab === "finding" && (
+            <div role="tabpanel" className="space-y-2">
+              {!context ? (
+                <div
+                  className={`flex items-center justify-center gap-2 py-4 text-center text-xs ${t.soft}`}
                 >
-                  <Send className="w-4 h-4" />
-                </button>
-              </form>
-
-              {/* Acordeón discreto para evidencia CSV */}
-              <div>
-                <button
-                  type="button"
-                  onClick={() => setShowCsvEvidence((v) => !v)}
-                  className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-slate-900/70 hover:bg-slate-900 border border-slate-800 font-hud text-xs text-slate-300 cursor-pointer"
-                >
-                  <span className="inline-flex items-center gap-1.5 text-teal-300">
-                    <FileCheck2 className="w-3.5 h-3.5" />
-                    Respaldo CSV ({context.evidence.length} registros)
-                  </span>
-                  {showCsvEvidence ? (
-                    <ChevronUp className="w-3.5 h-3.5" />
+                  {loadingCtx ? (
+                    <>
+                      <Loader2 className={`h-3.5 w-3.5 animate-spin ${t.accent}`} />
+                      Cargando experimento...
+                    </>
                   ) : (
-                    <ChevronDown className="w-3.5 h-3.5" />
+                    "Elige un experimento del ranking y te lo explico."
                   )}
-                </button>
-
-                {showCsvEvidence && (
-                  <div className="mt-1.5 space-y-1">
-                    {context.evidence.slice(0, 2).map((ev, idx) => (
-                      <div
-                        key={idx}
-                        className="px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-800 font-hud text-xs text-slate-300 flex justify-between"
-                      >
-                        <span className="truncate max-w-[235px] text-cyan-300">
-                          {ev.file}
-                        </span>
-                        <span>
-                          Fila #{ev.row} · {Math.round(ev.quality * 100)}%
-                        </span>
+                </div>
+              ) : (
+                <>
+                  {/* Experimento en contexto */}
+                  <div className="flex items-center gap-2">
+                    <div className="min-w-0 flex-1 font-hud text-[11px]">
+                      <div className={`truncate ${t.sub}`}>
+                        {context.finding.experiment} · {context.environment.label}
                       </div>
+                      <div className={t.muted}>
+                        {Math.round(context.environment.o2_fraction * 100)}% O₂ ·{" "}
+                        {fmt(context.environment.pressure_atm)} atm ·{" "}
+                        {context.environment.gravity_g === 0
+                          ? "µg"
+                          : `${context.environment.gravity_g} g`}
+                      </div>
+                    </div>
+                    {chatStarted && (
+                      <IconBtn label="Limpiar conversación" onClick={clearChat}>
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </IconBtn>
+                    )}
+                  </div>
+
+                  {/* Flamey espera hasta que se lo pidan */}
+                  {!chatStarted ? (
+                    <button
+                      type="button"
+                      onClick={explainCurrent}
+                      disabled={!canAsk}
+                      className="flex h-9 w-full cursor-pointer items-center justify-center gap-1.5 rounded-xl bg-teal-500 text-xs font-semibold text-slate-950 hover:bg-teal-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-300 disabled:opacity-40"
+                    >
+                      <Sparkles className="h-3.5 w-3.5" />
+                      Explicar este experimento
+                    </button>
+                  ) : (
+                    <div
+                      ref={listRef}
+                      aria-live="polite"
+                      className="max-h-56 space-y-1.5 overflow-y-auto"
+                    >
+                      {messages.map((m, i) =>
+                        m.role === "user" ? (
+                          <p
+                            key={i}
+                            className={`ml-8 rounded-xl rounded-br-sm px-2.5 py-1.5 text-xs ${t.userBubble}`}
+                          >
+                            {m.text}
+                          </p>
+                        ) : (
+                          <div
+                            key={i}
+                            className={`mr-4 rounded-xl rounded-bl-sm border px-2.5 py-2 ${t.botBubble}`}
+                          >
+                            <Answer text={m.text} />
+                          </div>
+                        )
+                      )}
+
+                      {streaming && (
+                        <div
+                          className={`mr-4 rounded-xl rounded-bl-sm border px-2.5 py-2 ${t.botBubble}`}
+                        >
+                          {draft ? (
+                            <>
+                              <Answer text={draft} />
+                              <span className="ml-1 inline-block h-3 w-1.5 animate-pulse bg-teal-500 align-middle" />
+                            </>
+                          ) : (
+                            <div
+                              className={`flex items-center gap-2 font-hud text-xs ${t.accent}`}
+                            >
+                              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                              Pensando...
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Preguntas rápidas */}
+                  <div className="-mx-3 flex gap-1.5 overflow-x-auto px-3 pb-0.5">
+                    {QUICK_QUESTIONS.map((qText) => (
+                      <button
+                        key={qText}
+                        type="button"
+                        disabled={!canAsk || streaming}
+                        onClick={() => submitQuestion(qText)}
+                        className={`shrink-0 cursor-pointer whitespace-nowrap rounded-full border px-2.5 py-1 text-[11px] disabled:opacity-40 ${t.chip}`}
+                      >
+                        {qText}
+                      </button>
                     ))}
                   </div>
-                )}
-              </div>
-            </>
-          ) : (
-            <p className="text-xs text-slate-300 bg-slate-900 p-3 rounded-xl border border-slate-800">
-              Haz clic en un módulo o experimento para ver el análisis científico, o
-              cambia a la pestaña <strong>Simulador O₂</strong> para probar materiales.
-            </p>
+
+                  <form onSubmit={handleAskSubmit} className="flex gap-1.5">
+                    <label htmlFor="flamey-ask-input" className="sr-only">
+                      Escribe tu pregunta
+                    </label>
+                    <input
+                      id="flamey-ask-input"
+                      type="text"
+                      value={question}
+                      disabled={!canAsk}
+                      onChange={(e) => setQuestion(e.target.value)}
+                      placeholder="Pregunta algo..."
+                      className={`h-8 min-w-0 flex-1 rounded-lg border px-2.5 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 disabled:opacity-50 ${t.field}`}
+                    />
+                    <button
+                      type="submit"
+                      disabled={!canAsk || streaming || !question.trim()}
+                      aria-label="Enviar pregunta"
+                      className="h-8 cursor-pointer rounded-lg bg-teal-500 px-2.5 text-slate-950 hover:bg-teal-400 disabled:opacity-40"
+                    >
+                      <Send className="h-3.5 w-3.5" />
+                    </button>
+                  </form>
+
+                  {/* Pie: fuentes, dato curioso, escuchar */}
+                  <div className="flex items-center gap-1">
+                    <IconBtn
+                      label="Ver registros PSI usados"
+                      active={showSources}
+                      onClick={() => setShowSources((v) => !v)}
+                    >
+                      <Database className="h-3.5 w-3.5" />
+                      {context.evidence.length}
+                    </IconBtn>
+                    {currentRule && (
+                      <IconBtn
+                        label="Mito y realidad"
+                        active={showRule}
+                        onClick={() => setShowRule((v) => !v)}
+                      >
+                        <Lightbulb className="h-3.5 w-3.5" />
+                      </IconBtn>
+                    )}
+                    {voiceAvailable && (
+                      <IconBtn
+                        label="Escuchar la última respuesta"
+                        disabled={streaming || !lastFlameyText}
+                        onClick={() => speakText(lastFlameyText)}
+                      >
+                        <Volume2 className="h-3.5 w-3.5" />
+                      </IconBtn>
+                    )}
+                  </div>
+
+                  {showSources && (
+                    <div className="space-y-1">
+                      {context.evidence.slice(0, 3).map((ev, idx) => (
+                        <div
+                          key={idx}
+                          className={`flex justify-between gap-2 rounded-lg border px-2 py-1 font-hud text-[11px] ${t.surface} ${t.soft}`}
+                        >
+                          <span className={`truncate ${t.file}`}>{ev.file}</span>
+                          <span className="shrink-0">
+                            Fila {ev.row} · {Math.round(ev.quality * 100)}%
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {showRule && currentRule && (
+                    <div className={`space-y-1 rounded-lg border p-2 text-xs ${t.surface}`}>
+                      <p className={t.myth}>Mito: {currentRule.mito}</p>
+                      <p className={t.fact}>Realidad: {currentRule.hecho}</p>
+                      <button
+                        type="button"
+                        onClick={() => setRuleIdx((i) => i + 1)}
+                        className={`cursor-pointer font-hud text-[11px] ${t.link}`}
+                      >
+                        Ver otro
+                      </button>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
           )}
-        </div>
-      )}
 
-      {/* 4. CONTENIDO DE PESTAÑA 2: SIMULADOR GUIADO EN 3 PASOS */}
-      {tab === "sim" && (
-        <div role="tabpanel" className="mt-3 space-y-2.5 max-h-[410px] overflow-y-auto pr-1">
-          {/* Paso 1: Entorno rápido */}
-          <div className="space-y-1">
-            <span className="block font-hud text-xs text-slate-300">
-              1. Elige entorno espacial:
-            </span>
-            <div className="flex flex-wrap gap-1.5">
-              {ENV_PRESETS.map((env) => {
-                const active = simEnvName === env.label && simO2 === env.o2;
-                return (
-                  <button
-                    key={env.id}
-                    type="button"
-                    aria-pressed={active}
-                    onClick={() => {
-                      setSimEnvName(env.label);
-                      setSimO2(env.o2);
-                      setSimPsi(env.psi);
-                      setSimGravity(env.g);
-                    }}
-                    className={`px-2.5 py-1.5 rounded-lg font-hud text-xs border transition cursor-pointer ${
-                      active
-                        ? "bg-cyan-500/25 border-cyan-400 text-cyan-100 font-bold"
-                        : "bg-slate-900 border-slate-800 text-slate-300 hover:border-slate-600"
-                    }`}
-                  >
-                    {env.label} · {env.o2}%
-                  </button>
-                );
-              })}
-            </div>
-          </div>
+          {/* ============ SIMULAR ============ */}
+          {tab === "sim" && (
+            <div role="tabpanel" className="space-y-2">
+              {/* Entorno */}
+              <div className="flex items-center gap-1">
+                <div className="grid flex-1 grid-cols-5 gap-1">
+                  {ENV_PRESETS.map((env) => {
+                    const active = simEnvName === env.label && simO2 === env.o2;
+                    return (
+                      <button
+                        key={env.id}
+                        type="button"
+                        title={`${env.label}: ${env.o2}% O₂, ${fmt(toAtm(env.psi))} atm, ${env.g} g`}
+                        aria-pressed={active}
+                        onClick={() => {
+                          setSimEnvName(env.label);
+                          setSimO2(env.o2);
+                          setSimPsi(env.psi);
+                          setSimGravity(env.g);
+                        }}
+                        className={`h-7 cursor-pointer rounded-lg border font-hud text-[11px] transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${
+                          active ? t.envOn : t.envOff
+                        }`}
+                      >
+                        {env.short}
+                      </button>
+                    );
+                  })}
+                </div>
+                <IconBtn
+                  label="Ajustar oxígeno, presión y gravedad"
+                  active={showAdvanced}
+                  onClick={() => setShowAdvanced((v) => !v)}
+                >
+                  <Sliders className="h-3.5 w-3.5" />
+                </IconBtn>
+              </div>
 
-          {/* Paso 2: Material como chips directos + campo opcional */}
-          <div className="space-y-1.5">
-            <span className="block font-hud text-xs text-slate-300">
-              2. Toca un material (o escribe otro):
-            </span>
-            <div className="flex flex-wrap gap-1.5">
-              {MATERIAL_PRESETS.map((mat) => {
-                const selected = !customMaterial.trim() && selectedPresetId === mat.id;
-                return (
-                  <button
-                    key={mat.id}
-                    type="button"
-                    aria-pressed={selected}
-                    onClick={() => {
-                      setSelectedPresetId(mat.id);
-                      setCustomMaterial("");
-                    }}
-                    className={`px-2.5 py-1 rounded-full text-xs border transition cursor-pointer ${
-                      selected
-                        ? "bg-teal-500/25 border-teal-400 text-teal-100 font-semibold"
-                        : "bg-slate-900 border-slate-800 text-slate-300 hover:border-slate-600"
-                    }`}
-                  >
-                    {mat.shortName}
-                  </button>
-                );
-              })}
-            </div>
+              {/* Ajuste fino */}
+              {showAdvanced && (
+                <div
+                  className={`space-y-2 rounded-lg border p-2 font-hud text-[11px] ${t.surface} ${t.soft}`}
+                >
+                  <label htmlFor="sim-o2-slider" className="flex items-center gap-2">
+                    <span className="w-14 shrink-0">Oxígeno</span>
+                    <input
+                      id="sim-o2-slider"
+                      type="range"
+                      min={21}
+                      max={100}
+                      value={simO2}
+                      onChange={(e) => {
+                        setSimO2(Number(e.target.value));
+                        setSimEnvName("Mezcla personalizada");
+                      }}
+                      className="h-1.5 min-w-0 flex-1 cursor-pointer accent-teal-500"
+                    />
+                    <span
+                      className={`w-12 shrink-0 text-right font-bold ${
+                        simO2 >= 50 ? t.danger : simO2 >= 30 ? t.warn : t.ok
+                      }`}
+                    >
+                      {simO2}%
+                    </span>
+                  </label>
 
-            <label htmlFor="sim-custom-material" className="sr-only">
-              Otro material personalizado
-            </label>
-            <input
-              id="sim-custom-material"
-              type="text"
-              value={customMaterial}
-              onChange={(e) => setCustomMaterial(e.target.value)}
-              placeholder="Otro material: ej. Velcro, Kapton, Batería Litio..."
-              className="w-full min-h-[34px] bg-slate-900 border border-slate-800 rounded-xl px-3 text-xs text-white placeholder:text-slate-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
-            />
-          </div>
+                  <label htmlFor="sim-psi-slider" className="flex items-center gap-2">
+                    <span className="w-14 shrink-0">Presión</span>
+                    <input
+                      id="sim-psi-slider"
+                      type="range"
+                      min={4.3}
+                      max={14.7}
+                      step={0.1}
+                      value={simPsi}
+                      onChange={(e) => {
+                        setSimPsi(Number(e.target.value));
+                        setSimEnvName("Mezcla personalizada");
+                      }}
+                      className="h-1.5 min-w-0 flex-1 cursor-pointer accent-cyan-500"
+                    />
+                    <span className={`w-12 shrink-0 text-right ${t.info}`}>
+                      {fmt(toAtm(simPsi))} atm
+                    </span>
+                  </label>
 
-          {/* Paso 3: Deslizador principal de Oxígeno y Presión */}
-          <div className="p-3 rounded-xl bg-slate-900 border border-slate-800 space-y-2.5">
-            <div>
-              <div className="flex justify-between items-center text-xs">
-                <label htmlFor="sim-o2-slider" className="font-hud text-slate-200">
-                  3. Nivel de Oxígeno (O₂)
+                  <label htmlFor="sim-gravity-select" className="flex items-center gap-2">
+                    <span className="w-14 shrink-0">Gravedad</span>
+                    <select
+                      id="sim-gravity-select"
+                      value={simGravity}
+                      onChange={(e) => {
+                        setSimGravity(Number(e.target.value));
+                        setSimEnvName("Mezcla personalizada");
+                      }}
+                      className={`h-7 min-w-0 flex-1 cursor-pointer rounded-lg border px-1.5 ${t.select}`}
+                    >
+                      <option value={0}>0 g (ISS / EVA)</option>
+                      <option value={0.165}>0,165 g (Luna)</option>
+                      <option value={0.38}>0,38 g (Marte)</option>
+                      <option value={1}>1 g (Tierra)</option>
+                    </select>
+                  </label>
+                </div>
+              )}
+
+              {/* Material */}
+              <div className="flex gap-1.5">
+                <label htmlFor="sim-material-select" className="sr-only">
+                  Material
                 </label>
-                <span
-                  className={`font-hud font-bold ${
-                    simO2 >= 50
-                      ? "text-rose-400"
-                      : simO2 >= 30
-                      ? "text-amber-300"
-                      : "text-emerald-300"
+                <select
+                  id="sim-material-select"
+                  value={selectedPresetId}
+                  onChange={(e) => {
+                    setSelectedPresetId(e.target.value);
+                    setCustomMaterial("");
+                  }}
+                  className={`h-8 min-w-0 flex-1 cursor-pointer rounded-lg border px-2 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${t.field} ${
+                    isCustomMaterial ? "opacity-50" : ""
                   }`}
                 >
-                  {simO2}% O₂
-                </span>
-              </div>
-              <input
-                id="sim-o2-slider"
-                type="range"
-                min={21}
-                max={100}
-                value={simO2}
-                onChange={(e) => {
-                  setSimO2(Number(e.target.value));
-                  setSimEnvName("Mezcla personalizada");
-                }}
-                className="w-full accent-teal-400 h-2 bg-slate-800 rounded-lg cursor-pointer mt-1.5"
-              />
-              <div className="flex justify-between text-[11px] text-slate-400 font-hud mt-0.5">
-                <span>21% ISS</span>
-                <span>32% Luna</span>
-                <span>100% Traje EVA</span>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-2 gap-2 pt-1 border-t border-slate-800/80">
-              <div>
-                <label
-                  htmlFor="sim-psi-slider"
-                  className="flex justify-between text-xs text-slate-300 font-hud"
-                >
-                  <span>Presión</span>
-                  <span className="text-cyan-300">{simPsi.toFixed(1)} psi</span>
+                  {MATERIAL_PRESETS.map((mat) => (
+                    <option key={mat.id} value={mat.id}>
+                      {mat.shortName}
+                    </option>
+                  ))}
+                </select>
+                <label htmlFor="sim-custom-material" className="sr-only">
+                  Otro material
                 </label>
                 <input
-                  id="sim-psi-slider"
-                  type="range"
-                  min={4.3}
-                  max={14.7}
-                  step={0.1}
-                  value={simPsi}
-                  onChange={(e) => {
-                    setSimPsi(Number(e.target.value));
-                    setSimEnvName("Mezcla personalizada");
-                  }}
-                  className="w-full accent-cyan-400 h-1.5 bg-slate-800 rounded-lg cursor-pointer mt-1.5"
+                  id="sim-custom-material"
+                  type="text"
+                  value={customMaterial}
+                  onChange={(e) => setCustomMaterial(e.target.value)}
+                  placeholder="Otro: Velcro..."
+                  className={`h-8 min-w-0 flex-1 rounded-lg border px-2.5 text-xs focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 ${t.field}`}
                 />
               </div>
 
-              <div>
-                <label
-                  htmlFor="sim-gravity-select"
-                  className="block text-xs text-slate-300 font-hud mb-1"
-                >
-                  Gravedad
-                </label>
-                <select
-                  id="sim-gravity-select"
-                  value={simGravity}
-                  onChange={(e) => setSimGravity(Number(e.target.value))}
-                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs text-slate-200 cursor-pointer"
-                >
-                  <option value={0}>0 g (ISS / EVA)</option>
-                  <option value={0.165}>0.165 g (Luna)</option>
-                  <option value={0.38}>0.38 g (Marte)</option>
-                  <option value={1}>1.0 g (Tierra)</option>
-                </select>
-              </div>
-            </div>
-          </div>
-
-          {/* Tarjeta visual de Dictamen en tiempo real */}
-          <div
-            role="status"
-            aria-live="polite"
-            className={`p-3 rounded-xl border flex items-center gap-3 ${
-              simResult.verdict === "PROHIBIDO"
-                ? "bg-rose-950/50 border-rose-500/60 text-rose-100"
-                : simResult.verdict === "RESTRINGIDO"
-                ? "bg-amber-950/50 border-amber-500/60 text-amber-100"
-                : "bg-emerald-950/50 border-emerald-500/60 text-emerald-100"
-            }`}
-          >
-            {simResult.verdict === "PROHIBIDO" ? (
-              <ShieldAlert className="w-6 h-6 text-rose-400 shrink-0" />
-            ) : simResult.verdict === "RESTRINGIDO" ? (
-              <AlertTriangle className="w-6 h-6 text-amber-400 shrink-0" />
-            ) : (
-              <ShieldCheck className="w-6 h-6 text-emerald-400 shrink-0" />
-            )}
-            <div className="min-w-0">
-              <div className="font-hud text-xs font-bold">
-                {simResult.verdict} · RIESGO {simResult.riskScore}/100
-              </div>
-              <div className="text-xs opacity-90">
-                Propagación estimada: <strong>{simResult.spreadMmPerSec} mm/s</strong>
-              </div>
-            </div>
-          </div>
-
-          {/* Explicación automática */}
-          <div className="bg-slate-900/95 p-3 rounded-xl border border-slate-800">
-            <MarkdownMessage
-              content={
-                simAnalysis ||
-                buildFallbackSimulationReport(
-                  simResult,
-                  customMaterial.trim() ? undefined : currentPreset.note
-                )
-              }
-            />
-            {streaming && (
-              <span className="inline-block w-1.5 h-3.5 ml-1 bg-teal-400 animate-pulse align-middle" />
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* 5. CONTENIDO DE PESTAÑA 3: REGLAS NASA */}
-      {tab === "rules" && (
-        <div role="tabpanel" className="mt-3 space-y-2 max-h-72 overflow-y-auto pr-1">
-          {rules ? (
-            rules.rules.slice(0, 4).map((r, i) => (
+              {/* Veredicto (toca para ver el porqué) */}
               <div
-                key={i}
-                className="p-3 rounded-xl bg-slate-900 border border-slate-800 text-xs space-y-1"
+                role="status"
+                aria-live="polite"
+                className={`rounded-xl border ${meta.box[themeName]}`}
               >
-                <p className="text-rose-300 line-through">Mito: {r.mito}</p>
-                <p className="text-emerald-200 font-medium">Realidad: {r.hecho}</p>
+                <button
+                  type="button"
+                  onClick={() => setShowWhy((v) => !v)}
+                  aria-expanded={showWhy}
+                  aria-label="Ver explicación del veredicto"
+                  className="block w-full cursor-pointer rounded-xl p-2.5 text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
+                >
+                  <div className="flex items-center gap-2.5">
+                    <VerdictIcon
+                      className={`h-6 w-6 shrink-0 ${meta.iconColor[themeName]}`}
+                    />
+                    <div className="min-w-0 flex-1">
+                      <div className="font-hud text-sm font-bold leading-tight">
+                        {meta.label}
+                      </div>
+                      <div className="truncate text-[11px] opacity-90">
+                        {simResult.materialName} · {simEnvName}
+                      </div>
+                    </div>
+                    <div className="shrink-0 text-right font-hud">
+                      <div className="text-base font-bold leading-none">
+                        {simResult.riskScore}
+                        <span className="text-[11px] font-normal opacity-70">/100</span>
+                      </div>
+                      <div className="mt-0.5 text-[11px] opacity-80">
+                        {simResult.spreadMmPerSec} mm/s
+                      </div>
+                    </div>
+                    {streaming ? (
+                      <Loader2 className="h-3.5 w-3.5 shrink-0 animate-spin opacity-70" />
+                    ) : showWhy ? (
+                      <ChevronUp className="h-3.5 w-3.5 shrink-0 opacity-70" />
+                    ) : (
+                      <ChevronDown className="h-3.5 w-3.5 shrink-0 opacity-70" />
+                    )}
+                  </div>
+                  <div className={`mt-2 h-1.5 overflow-hidden rounded-full ${t.track}`}>
+                    <div
+                      className={`h-full transition-all ${meta.bar}`}
+                      style={{ width: `${simResult.riskScore}%` }}
+                    />
+                  </div>
+                </button>
+
+                {showWhy && (
+                  <div className={`border-t px-2.5 pb-2.5 pt-2 ${t.whyDivider}`}>
+                    <div className="max-h-40 overflow-y-auto">
+                      <Answer text={simText} />
+                    </div>
+                    {voiceAvailable && (
+                      <div className="mt-2 flex justify-end">
+                        <IconBtn
+                          label="Escuchar explicación"
+                          disabled={streaming}
+                          onClick={() => speakText(simText)}
+                        >
+                          <Volume2 className="h-3.5 w-3.5" />
+                        </IconBtn>
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
-            ))
-          ) : (
-            <p className="text-xs text-slate-300">Cargando reglas NASA...</p>
+            </div>
           )}
         </div>
-      )}
-    </aside>
+      </aside>
+    </ThemeCtx.Provider>
   );
 }
