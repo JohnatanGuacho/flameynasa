@@ -20,12 +20,11 @@ import {
 import {
   Flame,
   FileCheck2,
-  X,
+  ChevronDown,
+  ChevronUp,
   BookOpen,
-  MessageSquare,
   Send,
   Loader2,
-  Database,
   RefreshCw,
   Volume2,
   VolumeX,
@@ -33,6 +32,7 @@ import {
   ShieldCheck,
   ShieldAlert,
   AlertTriangle,
+  Cpu,
   Sparkles,
 } from "lucide-react";
 
@@ -45,10 +45,11 @@ const RAG_MODE = "psi-rag";
 
 interface MaterialPreset {
   id: string;
+  shortName: string;
   name: string;
   category: string;
-  loi: number; // Índice Límite de Oxígeno (%) en 1 atm
-  evaRated: boolean; // Certificado para hipobárico 4.3 psi 100% O2
+  loi: number;
+  evaRated: boolean;
   baseSpread: number;
   note: string;
 }
@@ -56,6 +57,7 @@ interface MaterialPreset {
 const MATERIAL_PRESETS: MaterialPreset[] = [
   {
     id: "cotton",
+    shortName: "Algodón",
     name: "Algodón / Textiles comunes",
     category: "Celulosa orgánica",
     loi: 19,
@@ -65,6 +67,7 @@ const MATERIAL_PRESETS: MaterialPreset[] = [
   },
   {
     id: "foam",
+    shortName: "Espuma PU",
     name: "Espuma de Poliuretano",
     category: "Aislante polimérico",
     loi: 17,
@@ -74,6 +77,7 @@ const MATERIAL_PRESETS: MaterialPreset[] = [
   },
   {
     id: "pmma",
+    shortName: "Acrílico",
     name: "Acrílico / PMMA (Visores)",
     category: "Termoplástico óptico",
     loi: 18,
@@ -83,6 +87,7 @@ const MATERIAL_PRESETS: MaterialPreset[] = [
   },
   {
     id: "nylon",
+    shortName: "Nylon",
     name: "Nylon 6,6 / Correas estándar",
     category: "Poliamida sintética",
     loi: 24,
@@ -92,6 +97,7 @@ const MATERIAL_PRESETS: MaterialPreset[] = [
   },
   {
     id: "silicone",
+    shortName: "Silicona",
     name: "Silicona / Sellos y cables",
     category: "Elastómero",
     loi: 30,
@@ -101,6 +107,7 @@ const MATERIAL_PRESETS: MaterialPreset[] = [
   },
   {
     id: "ptfe",
+    shortName: "Teflón PTFE",
     name: "Teflón / PTFE (Cableado NASA)",
     category: "Fluoropolímero",
     loi: 95,
@@ -110,6 +117,7 @@ const MATERIAL_PRESETS: MaterialPreset[] = [
   },
   {
     id: "nomex",
+    shortName: "Nomex EVA",
     name: "Nomex / PBI (Tejido Traje EVA)",
     category: "Aramida ignífuga",
     loi: 36,
@@ -121,10 +129,15 @@ const MATERIAL_PRESETS: MaterialPreset[] = [
 
 const ENV_PRESETS = [
   { id: "iss", label: "ISS", o2: 21, psi: 14.7, g: 0 },
-  { id: "lunar", label: "Base Lunar", o2: 32, psi: 8.2, g: 0.165 },
+  { id: "lunar", label: "Luna", o2: 32, psi: 8.2, g: 0.165 },
   { id: "rover", label: "Rover", o2: 34, psi: 8.0, g: 0.165 },
   { id: "mars", label: "Marte", o2: 21, psi: 14.7, g: 0.38 },
   { id: "eva", label: "Traje EVA", o2: 100, psi: 4.3, g: 0 },
+];
+
+const QUICK_QUESTIONS = [
+  "¿Es peligroso en Traje EVA?",
+  "¿Cómo se apaga en 0g?",
 ];
 
 function computeSimulationPhysics(params: {
@@ -134,7 +147,6 @@ function computeSimulationPhysics(params: {
   pressurePsi: number;
   gravityG: number;
   environmentName: string;
-  userNote?: string;
 }): SimulationInput {
   const {
     preset,
@@ -143,23 +155,19 @@ function computeSimulationPhysics(params: {
     pressurePsi,
     gravityG,
     environmentName,
-    userNote,
   } = params;
 
   const isCustom = customMaterial.trim().length > 0;
   const materialName = isCustom ? customMaterial.trim() : preset.name;
   const materialCategory = isCustom ? "Material consultado" : preset.category;
 
-  // Presión parcial de oxígeno (psi): clave en trajes hipobáricos (4.3 psi * 100% = 4.3 psi)
   const ppO2 = (o2Percent / 100) * pressurePsi;
-  // La ausencia de N2 diluyente dispara la tasa de reacción en atmósferas >30% O2
   const diluentPenalty = Math.max(0, o2Percent - 21) * 0.85;
   const pressureFactor = pressurePsi / 14.7;
 
   let riskScore = 0;
 
   if (!isCustom && preset.evaRated && o2Percent === 100 && pressurePsi <= 4.5) {
-    // Nomex/PBI y PTFE están calificados para 100% O2 a baja presión (4.3 psi)
     riskScore = preset.id === "ptfe" ? 18 : 26;
   } else {
     const loiMargin = preset.loi - o2Percent;
@@ -171,7 +179,6 @@ function computeSimulationPhysics(params: {
     riskScore = Math.max(8, Math.min(99, Math.round(rawRisk)));
   }
 
-  // En 0g no hay flotabilidad natural, pero en atmósferas enriquecidas la llama por difusión se intensifica
   const gravityMultiplier =
     gravityG === 0 ? (o2Percent > 30 ? 1.15 : 0.82) : 0.95 + gravityG * 0.25;
 
@@ -200,26 +207,29 @@ function computeSimulationPhysics(params: {
     verdict,
     riskScore,
     spreadMmPerSec,
-    userNote,
   };
 }
 
-function buildFallbackSimulationReport(sim: SimulationInput, presetNote?: string): string {
+function buildFallbackSimulationReport(
+  sim: SimulationInput,
+  presetNote?: string
+): string {
   const ppO2 = ((sim.o2Percent / 100) * sim.pressurePsi).toFixed(2);
-  const gravLabel = sim.gravityG === 0 ? "microgravedad (0g)" : `${sim.gravityG}g`;
+  const gravLabel =
+    sim.gravityG === 0 ? "microgravedad (0g)" : `${sim.gravityG}g`;
 
   return [
-    `- **Dictamen (${sim.verdict} · Riesgo ${sim.riskScore}/100):** En ${sim.environmentName} (${sim.o2Percent}% O₂, ${sim.pressurePsi} psi, ppO₂ ${ppO2} psi), **${sim.materialName}** tiene propagación estimada de **${sim.spreadMmPerSec} mm/s**.`,
-    `- **Física en ${gravLabel}:** ${
+    `- **Dictamen (${sim.verdict}):** En ${sim.environmentName} (${sim.o2Percent}% O₂, ${sim.pressurePsi} psi, ppO₂ ${ppO2} psi), **${sim.materialName}** propaga a **${sim.spreadMmPerSec} mm/s**.`,
+    `- **Por qué ocurre en ${gravLabel}:** ${
       sim.o2Percent >= 30
-        ? `La baja fracción de nitrógeno diluyente acelera la ignición y sostiene llamas estables incluso en baja gravedad.`
-        : `Atmósfera normóxica controlada; la ausencia de convección natural limita la llama si no hay flujo forzado.`
+        ? "Sin nitrógeno suficiente para absorber calor, la llama acelera y se vuelve difícil de extinguir."
+        : "Atmósfera controlada; sin corrientes de aire forzado, la llama se limita por difusión."
     }`,
-    `- **Guía NASA-STD-6001B:** ${
+    `- **Recomendación NASA:** ${
       presetNote ||
       (sim.verdict === "PROHIBIDO"
-        ? "Sustituir por textiles ignífugos certificados (Nomex/PBI) o cableado PTFE."
-        : "Apto bajo control de configuración y monitoreo de sensores ópticos.")
+        ? "Reemplazar por textiles ignífugos certificados (Nomex/PBI) o cableado Teflón PTFE."
+        : "Permitido bajo control de configuración y sensores ópticos activos.")
     }`,
   ].join("\n");
 }
@@ -247,7 +257,7 @@ function renderInlineMarkdown(line: string): React.ReactNode[] {
       return (
         <code
           key={i}
-          className="px-1 py-0.5 rounded bg-slate-800 text-cyan-300 font-hud text-[11px]"
+          className="px-1.5 py-0.5 rounded bg-slate-800 text-cyan-300 font-hud text-xs"
         >
           {part.slice(1, -1)}
         </code>
@@ -261,15 +271,15 @@ function MarkdownMessage({ content }: { content: string }) {
   const lines = content.split("\n");
 
   return (
-    <div className="space-y-1.5">
+    <div className="space-y-2 text-[13px] leading-relaxed text-slate-100">
       {lines.map((rawLine, idx) => {
         const line = rawLine.trim();
-        if (!line) return <div key={idx} className="h-1" />;
+        if (!line) return null;
 
         const headingMatch = line.match(/^#{1,4}\s+(.*)$/);
         if (headingMatch) {
           return (
-            <p key={idx} className="font-semibold text-amber-300 text-xs pt-0.5">
+            <p key={idx} className="font-semibold text-amber-300 text-xs">
               {renderInlineMarkdown(headingMatch[1])}
             </p>
           );
@@ -278,8 +288,8 @@ function MarkdownMessage({ content }: { content: string }) {
         const bulletMatch = line.match(/^[-*•]\s+(.*)$/);
         if (bulletMatch) {
           return (
-            <div key={idx} className="flex items-start gap-2 pl-1">
-              <span className="text-teal-400 mt-0.5">•</span>
+            <div key={idx} className="flex items-start gap-2">
+              <span className="text-teal-400 font-bold mt-0.5">•</span>
               <span className="flex-1">{renderInlineMarkdown(bulletMatch[1])}</span>
             </div>
           );
@@ -324,7 +334,7 @@ function buildPsiRagReport(ctx: ContextOut, question?: string): string {
       q.includes("preven") ||
       q.includes("mitig")
     ) {
-      return `- **Acción:** Evitar ${
+      return `- **Cómo mitigarlo:** Evitar ${
         finding.material || "combustibles"
       } en >30% O₂, diluir con CO₂ o He y asegurar evacuación < ${
         environment.egress_s
@@ -334,22 +344,25 @@ function buildPsiRagReport(ctx: ContextOut, question?: string): string {
 
   return [
     `- **Dato PSI:** ${finding.narrative}`,
-    `- **Peligro en ${environment.label} (${o2Pct}% O₂):** ${
+    `- **Riesgo en ${environment.label} (${o2Pct}% O₂):** ${
       isCritical
         ? `Atmósfera enriquecida crítica; ${
             finding.material || "el material"
           } acelera su ignición (${topFactor}).`
         : `Condición nominal (${topFactor}); vigilar acumulación local de O₂.`
     }`,
-    `- **Acción:** Usar textiles ignífugos (Nomex/PBI) o dilución CO₂/He (${evidence.length} filas CSV).`,
+    `- **Prevención:** Usar textiles ignífugos (Nomex/PBI) o dilución CO₂/He (${evidence.length} filas CSV).`,
   ].join("\n");
 }
 
 export function FlameyWidget({ activeFinding, environmentKey }: Props) {
   const [open, setOpen] = useState(true);
+  const [tab, setTab] = useState<"finding" | "sim" | "rules">("finding");
+  const [showEngineBar, setShowEngineBar] = useState(false);
+  const [showCsvEvidence, setShowCsvEvidence] = useState(false);
+
   const [context, setContext] = useState<ContextOut | null>(null);
   const [rules, setRules] = useState<RulesOut | null>(null);
-  const [mode, setMode] = useState<"finding" | "rules" | "ask" | "sim">("finding");
 
   // Voz
   const [voiceEnabled, setVoiceEnabled] = useState(false);
@@ -366,7 +379,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
   const [streaming, setStreaming] = useState(false);
   const [question, setQuestion] = useState("");
 
-  // Estado del Simulador de Materiales y Atmósferas
+  // Simulador interactivo
   const [selectedPresetId, setSelectedPresetId] = useState<string>("cotton");
   const [customMaterial, setCustomMaterial] = useState<string>("");
   const [simO2, setSimO2] = useState<number>(100);
@@ -414,7 +427,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
     setVoiceEnabled((prev) => {
       const next = !prev;
       if (next) {
-        if (mode === "sim") speakSimulationVerdict(simResult);
+        if (tab === "sim") speakSimulationVerdict(simResult);
         else if (context) speakFindingAlert(context);
       } else {
         stopVoice();
@@ -500,7 +513,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
 
     stopVoice();
     setOpen(true);
-    setMode("finding");
+    setTab("finding");
     setAiExplanation("");
 
     api
@@ -546,14 +559,58 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
     };
   }, [activeFinding, environmentKey, modelReady, selectedModel]);
 
-  const handleAsk = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!question.trim() || !context) return;
+  // Evaluación automática en vivo cuando el usuario cambia material u O2 en el Simulador
+  useEffect(() => {
+    if (tab !== "sim") return;
+
+    const fallbackReport = buildFallbackSimulationReport(
+      simResult,
+      customMaterial.trim() ? undefined : currentPreset.note
+    );
+    setSimAnalysis(fallbackReport);
+
+    const timer = setTimeout(() => {
+      if (voiceEnabledRef.current) {
+        speakSimulationVerdict(simResult);
+      }
+
+      if (selectedModel === RAG_MODE || !modelReady) {
+        return;
+      }
+
+      streamAbortRef.current?.abort();
+      const controller = new AbortController();
+      streamAbortRef.current = controller;
+
+      setStreaming(true);
+      askMaterialSimulationStream({
+        model: selectedModel,
+        sim: simResult,
+        signal: controller.signal,
+        onToken: (text) => setSimAnalysis(text),
+      })
+        .catch((err) => {
+          if ((err as Error)?.name !== "AbortError") {
+            setSimAnalysis(fallbackReport);
+          }
+        })
+        .finally(() => {
+          if (!controller.signal.aborted) setStreaming(false);
+        });
+    }, 450);
+
+    return () => {
+      clearTimeout(timer);
+      streamAbortRef.current?.abort();
+    };
+  }, [tab, simResult, customMaterial, currentPreset.note, selectedModel, modelReady]);
+
+  const submitQuestion = async (rawQuestion: string) => {
+    const q = rawQuestion.trim();
+    if (!q || !context) return;
 
     stopVoice();
-    const q = question;
     setQuestion("");
-    setMode("finding");
 
     if (selectedModel === RAG_MODE || !modelReady) {
       const answer = buildPsiRagReport(context, q);
@@ -593,292 +650,437 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
     }
   };
 
-  const runMaterialSimulation = async () => {
-    stopVoice();
-    if (voiceEnabledRef.current) {
-      speakSimulationVerdict(simResult);
-    }
-
-    const fallbackReport = buildFallbackSimulationReport(
-      simResult,
-      customMaterial.trim() ? undefined : currentPreset.note
-    );
-
-    if (selectedModel === RAG_MODE || !modelReady) {
-      setSimAnalysis(fallbackReport);
-      return;
-    }
-
-    streamAbortRef.current?.abort();
-    const controller = new AbortController();
-    streamAbortRef.current = controller;
-
-    setSimAnalysis("");
-    setStreaming(true);
-
-    try {
-      await askMaterialSimulationStream({
-        model: selectedModel,
-        sim: simResult,
-        signal: controller.signal,
-        onToken: (text) => setSimAnalysis(text),
-      });
-    } catch (err) {
-      if ((err as Error)?.name !== "AbortError") {
-        setSimAnalysis(fallbackReport);
-      }
-    } finally {
-      if (!controller.signal.aborted) setStreaming(false);
-    }
+  const handleAskSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    submitQuestion(question);
   };
 
   if (!open) {
     return (
       <button
+        type="button"
         onClick={() => setOpen(true)}
-        className="fixed left-16 bottom-5 z-30 flex items-center gap-2 px-3.5 py-2 rounded-full bg-slate-900/95 border border-teal-500/50 text-teal-300 shadow-xl hover:scale-105 transition cursor-pointer"
+        aria-label="Abrir asistente Flamey"
+        className="fixed left-16 bottom-5 z-30 flex items-center gap-2.5 px-4 py-2.5 rounded-full bg-slate-950/95 border border-teal-400/60 text-teal-200 shadow-2xl hover:scale-105 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 transition cursor-pointer"
       >
         <Flame className="w-4 h-4 text-orange-400" />
-        <span className="font-hud text-xs font-semibold">FLAMEY</span>
+        <span className="font-hud text-xs font-bold tracking-wide">FLAMEY</span>
       </button>
     );
   }
 
   const isLocalModel = selectedModel !== RAG_MODE;
   const canAsk = !isLocalModel || modelReady;
-  const ppO2 = ((simO2 / 100) * simPsi).toFixed(2);
+  const shortModelName =
+    selectedModel === RAG_MODE ? "PSI-RAG" : selectedModel.split(":")[0];
 
   return (
-    <div className="fixed left-16 bottom-5 z-30 w-[365px] sm:w-[445px] rounded-2xl bg-slate-950/95 backdrop-blur-xl border border-slate-800 shadow-2xl p-3.5">
-      {/* Cabecera */}
-      <div className="flex items-start justify-between gap-2">
+    <aside
+      aria-label="Asistente de seguridad contra incendios Flamey"
+      className="fixed left-16 bottom-5 z-30 w-[370px] sm:w-[440px] rounded-2xl bg-slate-950/95 backdrop-blur-xl border border-slate-800 shadow-2xl p-4"
+    >
+      {/* 1. CABECERA LIMPIA */}
+      <div className="flex items-center justify-between gap-2">
         <div className="flex items-center gap-2.5 min-w-0">
-          <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-cyan-400 via-teal-500 to-orange-500 flex items-center justify-center shadow-lg shrink-0">
+          <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-cyan-400 via-teal-500 to-orange-500 flex items-center justify-center shadow-md shrink-0">
             <Flame className="w-5 h-5 text-slate-950 fill-slate-950" />
           </div>
           <div className="min-w-0">
-            <div className="flex items-center gap-1.5 flex-wrap">
-              <span className="font-hud text-[10px] tracking-widest text-amber-400">
+            <div className="flex items-center gap-2">
+              <h2 className="font-hud text-xs font-bold tracking-wider text-white">
                 FLAMEY SI
-              </span>
-
-              {models.length > 0 ? (
-                <select
-                  value={selectedModel}
-                  onChange={(e) => setSelectedModel(e.target.value)}
-                  className="bg-slate-900 border border-emerald-500/40 rounded px-1.5 py-0.5 font-hud text-[10px] text-emerald-300 max-w-[140px] truncate cursor-pointer"
-                >
-                  {models.map((m) => (
-                    <option key={m} value={m}>
-                      {m}
-                    </option>
-                  ))}
-                  <option value={RAG_MODE}>PSI-RAG (Sin GPU)</option>
-                </select>
-              ) : (
-                <span className="inline-flex items-center gap-1 bg-teal-950/80 border border-teal-500/40 rounded px-1.5 py-0.5 font-hud text-[10px] text-teal-300">
-                  <Database className="w-2.5 h-2.5" /> PSI-RAG
-                </span>
-              )}
-
-              <button
-                onClick={scanLocalModels}
-                disabled={scanning}
-                title="Re-escanear modelos locales de Ollama"
-                className="p-1 rounded bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300 cursor-pointer"
+              </h2>
+              <span
+                className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full font-hud text-[11px] ${
+                  isLocalModel
+                    ? "bg-emerald-500/15 text-emerald-300 border border-emerald-500/40"
+                    : "bg-teal-500/15 text-teal-300 border border-teal-500/40"
+                }`}
               >
-                <RefreshCw className={`w-2.5 h-2.5 ${scanning ? "animate-spin" : ""}`} />
-              </button>
-
-              {voiceAvailable && (
-                <button
-                  onClick={toggleVoice}
-                  title={voiceEnabled ? "Silenciar resumen de voz" : "Activar resumen de voz"}
-                  className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border font-hud text-[10px] transition cursor-pointer ${
-                    voiceEnabled
-                      ? "bg-teal-500/20 border-teal-400 text-teal-200"
-                      : "bg-slate-900 border-slate-700 text-slate-400 hover:text-slate-200"
-                  }`}
-                >
-                  {voiceEnabled ? (
-                    <>
-                      <Volume2 className="w-3 h-3 text-teal-300" />
-                      <span>Voz ON</span>
-                    </>
-                  ) : (
-                    <>
-                      <VolumeX className="w-3 h-3" />
-                      <span>Voz OFF</span>
-                    </>
-                  )}
-                </button>
-              )}
-
-              {isLocalModel && loadingModel && (
-                <span className="inline-flex items-center gap-1 font-hud text-[9px] text-amber-300">
-                  <Loader2 className="w-3 h-3 animate-spin" /> GPU...
-                </span>
-              )}
-              {isLocalModel && modelReady && !loadingModel && (
-                <span className="font-hud text-[9px] text-emerald-400">● Local</span>
-              )}
+                {loadingModel ? "Cargando..." : shortModelName}
+              </span>
             </div>
-
-            <p className="text-xs text-slate-200 leading-snug truncate mt-0.5">
-              {mode === "sim"
-                ? `Lab NASA-STD-6001B · ${simEnvName} (${simO2}% O₂ · ${simPsi} psi)`
+            <p className="text-xs text-slate-300 truncate mt-0.5">
+              {tab === "sim"
+                ? `${simEnvName} · ${simO2}% O₂ (${simPsi} psi)`
                 : context
                 ? `${context.finding.experiment} · ${context.environment.label}`
-                : "Selecciona un módulo o hallazgo para analizar."}
+                : "Selecciona un hallazgo o abre el simulador"}
             </p>
           </div>
         </div>
-        <button
-          onClick={() => {
-            stopVoice();
-            setOpen(false);
-          }}
-          className="text-slate-500 hover:text-slate-300 cursor-pointer"
-        >
-          <X className="w-4 h-4" />
-        </button>
-      </div>
 
-      {/* MODO 1: ANÁLISIS DE HALLAZGO PSI */}
-      {mode === "finding" && context && (
-        <div className="mt-3 space-y-2.5 max-h-64 overflow-y-auto pr-1">
-          {isLocalModel && loadingModel ? (
-            <div className="p-3 rounded-lg bg-slate-900/90 border border-amber-500/30 font-hud text-xs text-amber-300 flex items-center gap-2">
-              <Loader2 className="w-4 h-4 animate-spin shrink-0" />
-              Cargando {selectedModel} en tu GPU...
-            </div>
-          ) : (
-            <div className="text-xs text-slate-200 leading-relaxed bg-slate-900/90 p-3 rounded-lg border border-slate-800">
-              <MarkdownMessage content={aiExplanation || buildPsiRagReport(context)} />
-              {streaming && (
-                <span className="inline-block w-1.5 h-3.5 ml-1 bg-teal-400 animate-pulse align-middle" />
+        {/* Controles esenciales: Voz, Motor IA y Minimizar */}
+        <div className="flex items-center gap-1.5 shrink-0">
+          {voiceAvailable && (
+            <button
+              type="button"
+              onClick={toggleVoice}
+              aria-pressed={voiceEnabled}
+              aria-label={voiceEnabled ? "Desactivar voz" : "Activar voz"}
+              className={`inline-flex items-center gap-1.5 min-h-[34px] px-2.5 rounded-lg border font-hud text-xs transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 cursor-pointer ${
+                voiceEnabled
+                  ? "bg-teal-500/25 border-teal-400 text-teal-100"
+                  : "bg-slate-900 border-slate-700 text-slate-300 hover:text-white"
+              }`}
+            >
+              {voiceEnabled ? (
+                <Volume2 className="w-3.5 h-3.5 text-teal-300" />
+              ) : (
+                <VolumeX className="w-3.5 h-3.5" />
               )}
-            </div>
+              <span>Voz</span>
+            </button>
           )}
 
-          <div className="font-hud text-[10px] text-teal-400 flex items-center gap-1 pt-0.5">
-            <FileCheck2 className="w-3.5 h-3.5" /> RESPALDO CSV REAL ({context.evidence.length} FILAS)
-          </div>
-          {context.evidence.slice(0, 2).map((ev, idx) => (
-            <div
-              key={idx}
-              className="p-2 rounded bg-slate-900/75 border border-slate-800 font-hud text-[10px] text-slate-300 flex justify-between"
-            >
-              <span className="truncate max-w-[245px] text-cyan-300">{ev.file}</span>
-              <span>
-                Fila #{ev.row} · Q {Math.round(ev.quality * 100)}%
-              </span>
-            </div>
-          ))}
+          <button
+            type="button"
+            onClick={() => setShowEngineBar((v) => !v)}
+            aria-expanded={showEngineBar}
+            aria-label="Configurar motor de IA"
+            title="Cambiar modelo local o modo PSI-RAG"
+            className={`min-h-[34px] px-2 rounded-lg border transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 cursor-pointer ${
+              showEngineBar
+                ? "bg-slate-800 border-emerald-400/60 text-emerald-300"
+                : "bg-slate-900 border-slate-700 text-slate-300 hover:text-white"
+            }`}
+          >
+            <Cpu className="w-3.5 h-3.5" />
+          </button>
+
+          <button
+            type="button"
+            onClick={() => {
+              stopVoice();
+              setOpen(false);
+            }}
+            aria-label="Minimizar Flamey"
+            className="min-h-[34px] px-2 rounded-lg bg-slate-900 border border-slate-800 text-slate-400 hover:text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 cursor-pointer"
+          >
+            <ChevronDown className="w-4 h-4" />
+          </button>
+        </div>
+      </div>
+
+      {/* Barra plegable de selección de motor IA (solo visible si el usuario la abre) */}
+      {showEngineBar && (
+        <div className="mt-2.5 p-2 rounded-xl bg-slate-900 border border-slate-800 flex items-center gap-2">
+          <label htmlFor="flamey-model-select" className="font-hud text-xs text-slate-300 shrink-0">
+            Motor IA:
+          </label>
+          <select
+            id="flamey-model-select"
+            value={selectedModel}
+            onChange={(e) => setSelectedModel(e.target.value)}
+            className="flex-1 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs text-emerald-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 cursor-pointer"
+          >
+            {models.map((m) => (
+              <option key={m} value={m}>
+                {m} (GPU Local)
+              </option>
+            ))}
+            <option value={RAG_MODE}>PSI-RAG (Instantáneo sin GPU)</option>
+          </select>
+          <button
+            type="button"
+            onClick={scanLocalModels}
+            disabled={scanning}
+            aria-label="Buscar modelos locales en Ollama"
+            className="p-1.5 rounded-lg bg-slate-950 border border-slate-700 text-slate-200 hover:border-teal-400 cursor-pointer"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${scanning ? "animate-spin" : ""}`} />
+          </button>
         </div>
       )}
 
-      {/* MODO 2: SIMULADOR INTERACTIVO DE MATERIALES Y ATMÓSFERAS */}
-      {mode === "sim" && (
-        <div className="mt-3 space-y-2.5 max-h-80 overflow-y-auto pr-1">
-          {/* Atajos de Misión / Traje EVA */}
-          <div className="flex flex-wrap gap-1">
-            {ENV_PRESETS.map((env) => {
-              const active = simEnvName === env.label && simO2 === env.o2;
-              return (
+      {/* 2. PESTAÑAS PRINCIPALES DE NAVEGACIÓN */}
+      <div
+        role="tablist"
+        aria-label="Secciones de Flamey"
+        className="grid grid-cols-3 gap-1.5 mt-3 p-1 rounded-xl bg-slate-900 border border-slate-800"
+      >
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "finding"}
+          onClick={() => setTab("finding")}
+          className={`flex items-center justify-center gap-1.5 py-2 rounded-lg font-hud text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 cursor-pointer ${
+            tab === "finding"
+              ? "bg-teal-500 text-slate-950 shadow"
+              : "text-slate-300 hover:text-white"
+          }`}
+        >
+          <Sparkles className="w-3.5 h-3.5" />
+          <span>Análisis PSI</span>
+        </button>
+
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "sim"}
+          onClick={() => setTab("sim")}
+          className={`flex items-center justify-center gap-1.5 py-2 rounded-lg font-hud text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 cursor-pointer ${
+            tab === "sim"
+              ? "bg-cyan-400 text-slate-950 shadow"
+              : "text-slate-300 hover:text-white"
+          }`}
+        >
+          <Sliders className="w-3.5 h-3.5" />
+          <span>Simulador O₂</span>
+        </button>
+
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "rules"}
+          onClick={() => setTab("rules")}
+          className={`flex items-center justify-center gap-1.5 py-2 rounded-lg font-hud text-xs font-semibold transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400 cursor-pointer ${
+            tab === "rules"
+              ? "bg-amber-400 text-slate-950 shadow"
+              : "text-slate-300 hover:text-white"
+          }`}
+        >
+          <BookOpen className="w-3.5 h-3.5" />
+          <span>Reglas NASA</span>
+        </button>
+      </div>
+
+      {/* 3. CONTENIDO DE PESTAÑA 1: ANÁLISIS PSI + PREGUNTA RÁPIDA */}
+      {tab === "finding" && (
+        <div role="tabpanel" className="mt-3 space-y-2.5">
+          {context ? (
+            <>
+              <div
+                aria-live="polite"
+                className="max-h-52 overflow-y-auto bg-slate-900/95 p-3 rounded-xl border border-slate-800"
+              >
+                {isLocalModel && loadingModel ? (
+                  <div className="flex items-center gap-2 text-xs text-amber-300 font-hud py-2">
+                    <Loader2 className="w-4 h-4 animate-spin shrink-0" />
+                    <span>Preparando {shortModelName} en tu GPU...</span>
+                  </div>
+                ) : (
+                  <>
+                    <MarkdownMessage
+                      content={aiExplanation || buildPsiRagReport(context)}
+                    />
+                    {streaming && (
+                      <span className="inline-block w-1.5 h-3.5 ml-1 bg-teal-400 animate-pulse align-middle" />
+                    )}
+                  </>
+                )}
+              </div>
+
+              {/* Preguntas de 1 clic + campo libre */}
+              <div className="flex flex-wrap gap-1.5">
+                {QUICK_QUESTIONS.map((qText) => (
+                  <button
+                    key={qText}
+                    type="button"
+                    disabled={!canAsk || streaming}
+                    onClick={() => submitQuestion(qText)}
+                    className="px-2.5 py-1 rounded-full bg-slate-900 hover:bg-slate-800 border border-slate-700 text-xs text-teal-200 disabled:opacity-40 cursor-pointer"
+                  >
+                    {qText}
+                  </button>
+                ))}
+              </div>
+
+              <form onSubmit={handleAskSubmit} className="flex gap-1.5">
+                <label htmlFor="flamey-ask-input" className="sr-only">
+                  Pregunta sobre este experimento
+                </label>
+                <input
+                  id="flamey-ask-input"
+                  type="text"
+                  value={question}
+                  disabled={!canAsk}
+                  onChange={(e) => setQuestion(e.target.value)}
+                  placeholder="Haz una pregunta puntual..."
+                  className="flex-1 min-h-[36px] bg-slate-900 border border-slate-700 rounded-xl px-3 text-xs text-white placeholder:text-slate-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400 disabled:opacity-50"
+                />
                 <button
-                  key={env.id}
-                  type="button"
-                  onClick={() => {
-                    setSimEnvName(env.label);
-                    setSimO2(env.o2);
-                    setSimPsi(env.psi);
-                    setSimGravity(env.g);
-                    setSimAnalysis("");
-                  }}
-                  className={`px-2 py-0.5 rounded font-hud text-[10px] border transition cursor-pointer ${
-                    active
-                      ? "bg-teal-500/25 border-teal-400 text-teal-200"
-                      : "bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200"
-                  }`}
+                  type="submit"
+                  disabled={!canAsk || streaming || !question.trim()}
+                  aria-label="Enviar pregunta"
+                  className="min-h-[36px] px-3 rounded-xl bg-teal-500 text-slate-950 font-semibold hover:bg-teal-400 disabled:opacity-40 cursor-pointer"
                 >
-                  {env.label} ({env.o2}%)
+                  <Send className="w-4 h-4" />
                 </button>
-              );
-            })}
+              </form>
+
+              {/* Acordeón discreto para evidencia CSV */}
+              <div>
+                <button
+                  type="button"
+                  onClick={() => setShowCsvEvidence((v) => !v)}
+                  className="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg bg-slate-900/70 hover:bg-slate-900 border border-slate-800 font-hud text-xs text-slate-300 cursor-pointer"
+                >
+                  <span className="inline-flex items-center gap-1.5 text-teal-300">
+                    <FileCheck2 className="w-3.5 h-3.5" />
+                    Respaldo CSV ({context.evidence.length} registros)
+                  </span>
+                  {showCsvEvidence ? (
+                    <ChevronUp className="w-3.5 h-3.5" />
+                  ) : (
+                    <ChevronDown className="w-3.5 h-3.5" />
+                  )}
+                </button>
+
+                {showCsvEvidence && (
+                  <div className="mt-1.5 space-y-1">
+                    {context.evidence.slice(0, 2).map((ev, idx) => (
+                      <div
+                        key={idx}
+                        className="px-2.5 py-1.5 rounded-lg bg-slate-900 border border-slate-800 font-hud text-xs text-slate-300 flex justify-between"
+                      >
+                        <span className="truncate max-w-[235px] text-cyan-300">
+                          {ev.file}
+                        </span>
+                        <span>
+                          Fila #{ev.row} · {Math.round(ev.quality * 100)}%
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </>
+          ) : (
+            <p className="text-xs text-slate-300 bg-slate-900 p-3 rounded-xl border border-slate-800">
+              Haz clic en un módulo o experimento para ver el análisis científico, o
+              cambia a la pestaña <strong>Simulador O₂</strong> para probar materiales.
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* 4. CONTENIDO DE PESTAÑA 2: SIMULADOR GUIADO EN 3 PASOS */}
+      {tab === "sim" && (
+        <div role="tabpanel" className="mt-3 space-y-2.5 max-h-[410px] overflow-y-auto pr-1">
+          {/* Paso 1: Entorno rápido */}
+          <div className="space-y-1">
+            <span className="block font-hud text-xs text-slate-300">
+              1. Elige entorno espacial:
+            </span>
+            <div className="flex flex-wrap gap-1.5">
+              {ENV_PRESETS.map((env) => {
+                const active = simEnvName === env.label && simO2 === env.o2;
+                return (
+                  <button
+                    key={env.id}
+                    type="button"
+                    aria-pressed={active}
+                    onClick={() => {
+                      setSimEnvName(env.label);
+                      setSimO2(env.o2);
+                      setSimPsi(env.psi);
+                      setSimGravity(env.g);
+                    }}
+                    className={`px-2.5 py-1.5 rounded-lg font-hud text-xs border transition cursor-pointer ${
+                      active
+                        ? "bg-cyan-500/25 border-cyan-400 text-cyan-100 font-bold"
+                        : "bg-slate-900 border-slate-800 text-slate-300 hover:border-slate-600"
+                    }`}
+                  >
+                    {env.label} · {env.o2}%
+                  </button>
+                );
+              })}
+            </div>
           </div>
 
-          {/* Selector de Material o consulta personalizada */}
-          <div className="grid grid-cols-1 gap-1.5 bg-slate-900/90 p-2.5 rounded-lg border border-slate-800">
-            <label className="font-hud text-[10px] text-slate-400">
-              MATERIAL A EVALUAR EN NASA
-            </label>
-            <select
-              value={selectedPresetId}
-              onChange={(e) => {
-                setSelectedPresetId(e.target.value);
-                setCustomMaterial("");
-                setSimAnalysis("");
-              }}
-              className="bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs text-slate-100 cursor-pointer"
-            >
-              {MATERIAL_PRESETS.map((mat) => (
-                <option key={mat.id} value={mat.id}>
-                  {mat.name} (LOI {mat.loi}%)
-                </option>
-              ))}
-            </select>
+          {/* Paso 2: Material como chips directos + campo opcional */}
+          <div className="space-y-1.5">
+            <span className="block font-hud text-xs text-slate-300">
+              2. Toca un material (o escribe otro):
+            </span>
+            <div className="flex flex-wrap gap-1.5">
+              {MATERIAL_PRESETS.map((mat) => {
+                const selected = !customMaterial.trim() && selectedPresetId === mat.id;
+                return (
+                  <button
+                    key={mat.id}
+                    type="button"
+                    aria-pressed={selected}
+                    onClick={() => {
+                      setSelectedPresetId(mat.id);
+                      setCustomMaterial("");
+                    }}
+                    className={`px-2.5 py-1 rounded-full text-xs border transition cursor-pointer ${
+                      selected
+                        ? "bg-teal-500/25 border-teal-400 text-teal-100 font-semibold"
+                        : "bg-slate-900 border-slate-800 text-slate-300 hover:border-slate-600"
+                    }`}
+                  >
+                    {mat.shortName}
+                  </button>
+                );
+              })}
+            </div>
 
+            <label htmlFor="sim-custom-material" className="sr-only">
+              Otro material personalizado
+            </label>
             <input
+              id="sim-custom-material"
               type="text"
               value={customMaterial}
-              onChange={(e) => {
-                setCustomMaterial(e.target.value);
-                setSimAnalysis("");
-              }}
-              placeholder="O escribe otro: Velcro, Kapton, Batería Litio..."
-              className="bg-slate-950 border border-slate-800 rounded px-2 py-1 text-[11px] text-white placeholder:text-slate-500 focus:outline-none focus:border-teal-400"
+              onChange={(e) => setCustomMaterial(e.target.value)}
+              placeholder="Otro material: ej. Velcro, Kapton, Batería Litio..."
+              className="w-full min-h-[34px] bg-slate-900 border border-slate-800 rounded-xl px-3 text-xs text-white placeholder:text-slate-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-400"
             />
           </div>
 
-          {/* Controles de Variables: O2 %, Presión psi y Gravedad g */}
-          <div className="bg-slate-900/90 p-2.5 rounded-lg border border-slate-800 space-y-2">
+          {/* Paso 3: Deslizador principal de Oxígeno y Presión */}
+          <div className="p-3 rounded-xl bg-slate-900 border border-slate-800 space-y-2.5">
             <div>
-              <div className="flex justify-between font-hud text-[10px]">
-                <span className="text-slate-300">CONCENTRACIÓN O₂</span>
+              <div className="flex justify-between items-center text-xs">
+                <label htmlFor="sim-o2-slider" className="font-hud text-slate-200">
+                  3. Nivel de Oxígeno (O₂)
+                </label>
                 <span
-                  className={
+                  className={`font-hud font-bold ${
                     simO2 >= 50
-                      ? "text-rose-400 font-bold"
+                      ? "text-rose-400"
                       : simO2 >= 30
-                      ? "text-amber-300 font-bold"
+                      ? "text-amber-300"
                       : "text-emerald-300"
-                  }
+                  }`}
                 >
-                  {simO2}% O₂ · ppO₂ {ppO2} psi
+                  {simO2}% O₂
                 </span>
               </div>
               <input
+                id="sim-o2-slider"
                 type="range"
                 min={21}
                 max={100}
                 value={simO2}
                 onChange={(e) => {
                   setSimO2(Number(e.target.value));
-                  setSimEnvName("Atmósfera Custom");
-                  setSimAnalysis("");
+                  setSimEnvName("Mezcla personalizada");
                 }}
-                className="w-full accent-teal-400 h-1.5 bg-slate-800 rounded-lg cursor-pointer mt-1"
+                className="w-full accent-teal-400 h-2 bg-slate-800 rounded-lg cursor-pointer mt-1.5"
               />
+              <div className="flex justify-between text-[11px] text-slate-400 font-hud mt-0.5">
+                <span>21% ISS</span>
+                <span>32% Luna</span>
+                <span>100% Traje EVA</span>
+              </div>
             </div>
 
-            <div className="grid grid-cols-2 gap-2 pt-0.5">
+            <div className="grid grid-cols-2 gap-2 pt-1 border-t border-slate-800/80">
               <div>
-                <div className="flex justify-between font-hud text-[10px] text-slate-400">
-                  <span>PRESIÓN</span>
+                <label
+                  htmlFor="sim-psi-slider"
+                  className="flex justify-between text-xs text-slate-300 font-hud"
+                >
+                  <span>Presión</span>
                   <span className="text-cyan-300">{simPsi.toFixed(1)} psi</span>
-                </div>
+                </label>
                 <input
+                  id="sim-psi-slider"
                   type="range"
                   min={4.3}
                   max={14.7}
@@ -886,25 +1088,24 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
                   value={simPsi}
                   onChange={(e) => {
                     setSimPsi(Number(e.target.value));
-                    setSimEnvName("Atmósfera Custom");
-                    setSimAnalysis("");
+                    setSimEnvName("Mezcla personalizada");
                   }}
-                  className="w-full accent-cyan-400 h-1.5 bg-slate-800 rounded-lg cursor-pointer mt-1"
+                  className="w-full accent-cyan-400 h-1.5 bg-slate-800 rounded-lg cursor-pointer mt-1.5"
                 />
               </div>
 
               <div>
-                <div className="flex justify-between font-hud text-[10px] text-slate-400">
-                  <span>GRAVEDAD</span>
-                  <span className="text-amber-300">{simGravity} g</span>
-                </div>
+                <label
+                  htmlFor="sim-gravity-select"
+                  className="block text-xs text-slate-300 font-hud mb-1"
+                >
+                  Gravedad
+                </label>
                 <select
+                  id="sim-gravity-select"
                   value={simGravity}
-                  onChange={(e) => {
-                    setSimGravity(Number(e.target.value));
-                    setSimAnalysis("");
-                  }}
-                  className="w-full mt-0.5 bg-slate-950 border border-slate-700 rounded px-1.5 py-0.5 font-hud text-[10px] text-slate-200 cursor-pointer"
+                  onChange={(e) => setSimGravity(Number(e.target.value))}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs text-slate-200 cursor-pointer"
                 >
                   <option value={0}>0 g (ISS / EVA)</option>
                   <option value={0.165}>0.165 g (Luna)</option>
@@ -915,47 +1116,37 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
             </div>
           </div>
 
-          {/* Tarjeta de Dictamen Físico Instantáneo */}
+          {/* Tarjeta visual de Dictamen en tiempo real */}
           <div
-            className={`p-2.5 rounded-lg border flex items-center justify-between gap-2 ${
+            role="status"
+            aria-live="polite"
+            className={`p-3 rounded-xl border flex items-center gap-3 ${
               simResult.verdict === "PROHIBIDO"
-                ? "bg-rose-950/40 border-rose-500/50 text-rose-200"
+                ? "bg-rose-950/50 border-rose-500/60 text-rose-100"
                 : simResult.verdict === "RESTRINGIDO"
-                ? "bg-amber-950/40 border-amber-500/50 text-amber-200"
-                : "bg-emerald-950/40 border-emerald-500/50 text-emerald-200"
+                ? "bg-amber-950/50 border-amber-500/60 text-amber-100"
+                : "bg-emerald-950/50 border-emerald-500/60 text-emerald-100"
             }`}
           >
-            <div className="flex items-center gap-2">
-              {simResult.verdict === "PROHIBIDO" ? (
-                <ShieldAlert className="w-5 h-5 text-rose-400 shrink-0" />
-              ) : simResult.verdict === "RESTRINGIDO" ? (
-                <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0" />
-              ) : (
-                <ShieldCheck className="w-5 h-5 text-emerald-400 shrink-0" />
-              )}
-              <div>
-                <div className="font-hud text-[11px] font-bold">
-                  {simResult.verdict} · RIESGO {simResult.riskScore}/100
-                </div>
-                <div className="font-hud text-[10px] opacity-85">
-                  Propagación est.: {simResult.spreadMmPerSec} mm/s
-                </div>
+            {simResult.verdict === "PROHIBIDO" ? (
+              <ShieldAlert className="w-6 h-6 text-rose-400 shrink-0" />
+            ) : simResult.verdict === "RESTRINGIDO" ? (
+              <AlertTriangle className="w-6 h-6 text-amber-400 shrink-0" />
+            ) : (
+              <ShieldCheck className="w-6 h-6 text-emerald-400 shrink-0" />
+            )}
+            <div className="min-w-0">
+              <div className="font-hud text-xs font-bold">
+                {simResult.verdict} · RIESGO {simResult.riskScore}/100
+              </div>
+              <div className="text-xs opacity-90">
+                Propagación estimada: <strong>{simResult.spreadMmPerSec} mm/s</strong>
               </div>
             </div>
-
-            <button
-              type="button"
-              disabled={!canAsk || streaming}
-              onClick={runMaterialSimulation}
-              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-teal-500 hover:bg-teal-400 text-slate-950 font-hud text-[10px] font-bold disabled:opacity-40 cursor-pointer shrink-0"
-            >
-              <Sparkles className="w-3 h-3" />
-              EVALUAR IA
-            </button>
           </div>
 
-          {/* Resultado de IA o análisis técnico */}
-          <div className="text-xs text-slate-200 leading-relaxed bg-slate-900/90 p-2.5 rounded-lg border border-slate-800">
+          {/* Explicación automática */}
+          <div className="bg-slate-900/95 p-3 rounded-xl border border-slate-800">
             <MarkdownMessage
               content={
                 simAnalysis ||
@@ -972,81 +1163,24 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
         </div>
       )}
 
-      {/* MODO 3: REGLAS NASA */}
-      {mode === "rules" && rules && (
-        <div className="mt-3 space-y-2 max-h-56 overflow-y-auto pr-1">
-          {rules.rules.slice(0, 4).map((r, i) => (
-            <div
-              key={i}
-              className="p-2 rounded bg-slate-900 border border-slate-800 text-[11px]"
-            >
-              <p className="text-rose-300 line-through">{r.mito}</p>
-              <p className="text-emerald-300 mt-0.5">{r.hecho}</p>
-            </div>
-          ))}
+      {/* 5. CONTENIDO DE PESTAÑA 3: REGLAS NASA */}
+      {tab === "rules" && (
+        <div role="tabpanel" className="mt-3 space-y-2 max-h-72 overflow-y-auto pr-1">
+          {rules ? (
+            rules.rules.slice(0, 4).map((r, i) => (
+              <div
+                key={i}
+                className="p-3 rounded-xl bg-slate-900 border border-slate-800 text-xs space-y-1"
+              >
+                <p className="text-rose-300 line-through">Mito: {r.mito}</p>
+                <p className="text-emerald-200 font-medium">Realidad: {r.hecho}</p>
+              </div>
+            ))
+          ) : (
+            <p className="text-xs text-slate-300">Cargando reglas NASA...</p>
+          )}
         </div>
       )}
-
-      {/* MODO 4: PREGUNTA LIBRE */}
-      {mode === "ask" && (
-        <form onSubmit={handleAsk} className="mt-3 flex gap-1.5">
-          <input
-            type="text"
-            value={question}
-            disabled={!canAsk}
-            onChange={(e) => setQuestion(e.target.value)}
-            placeholder="Ej. ¿Es peligroso en Traje EVA o Luna?"
-            className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-white focus:outline-none focus:border-teal-400 disabled:opacity-50"
-          />
-          <button
-            type="submit"
-            disabled={!canAsk || streaming || !question.trim()}
-            className="px-2.5 py-1.5 rounded-lg bg-teal-500 text-slate-950 font-semibold text-xs hover:bg-teal-400 disabled:opacity-40 cursor-pointer"
-          >
-            <Send className="w-3.5 h-3.5" />
-          </button>
-        </form>
-      )}
-
-      {/* Barra inferior de navegación */}
-      <div className="mt-3 pt-2 border-t border-slate-800/80 flex items-center justify-between gap-1.5 flex-wrap">
-        <button
-          disabled={!canAsk}
-          onClick={() => setMode(mode === "ask" ? "finding" : "ask")}
-          className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full border font-hud text-[10px] disabled:opacity-40 cursor-pointer ${
-            mode === "ask"
-              ? "bg-teal-500/20 border-teal-400 text-teal-200"
-              : "bg-slate-900 hover:bg-slate-800 border-teal-500/50 text-teal-300"
-          }`}
-        >
-          <MessageSquare className="w-3 h-3" />
-          {canAsk ? "PREGÚNTAME" : "CARGANDO..."}
-        </button>
-
-        <button
-          onClick={() => setMode(mode === "sim" ? "finding" : "sim")}
-          className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full border font-hud text-[10px] cursor-pointer ${
-            mode === "sim"
-              ? "bg-cyan-500/25 border-cyan-400 text-cyan-200 font-bold"
-              : "bg-slate-900 hover:bg-slate-800 border-cyan-500/50 text-cyan-300"
-          }`}
-        >
-          <Sliders className="w-3 h-3" />
-          {mode === "sim" ? "VER PSI" : "SIMULAR O₂"}
-        </button>
-
-        <button
-          onClick={() => setMode(mode === "rules" ? "finding" : "rules")}
-          className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full border font-hud text-[10px] cursor-pointer ${
-            mode === "rules"
-              ? "bg-amber-500/20 border-amber-400 text-amber-200"
-              : "bg-slate-900 hover:bg-slate-800 border-slate-700 text-slate-300"
-          }`}
-        >
-          <BookOpen className="w-3 h-3 text-amber-400" />
-          REGLAS NASA
-        </button>
-      </div>
-    </div>
+    </aside>
   );
 }
