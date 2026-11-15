@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import { api, atmToPsi, ContextOut, FindingOut, RulesOut } from "@/lib/api";
 import {
   askOllamaStream,
@@ -8,6 +8,12 @@ import {
   unloadOllamaModel,
   warmupOllamaModel,
 } from "@/lib/ollama";
+import {
+  createStreamSpeaker,
+  isVoiceSupported,
+  speakText,
+  stopVoice,
+} from "@/lib/voice";
 import {
   Flame,
   FileCheck2,
@@ -17,6 +23,9 @@ import {
   Send,
   Loader2,
   Database,
+  RefreshCw,
+  Volume2,
+  VolumeX,
 } from "lucide-react";
 
 interface Props {
@@ -24,7 +33,79 @@ interface Props {
   environmentKey: string;
 }
 
-/** Síntesis instantánea tipo RAG usando 100% datos reales de PSI cuando el visitante no tiene Ollama */
+const RAG_MODE = "psi-rag";
+
+/** Renderiza negritas (**texto**), cursivas (*texto*) y listas sin mostrar asteriscos crudos */
+function renderInlineMarkdown(line: string): React.ReactNode[] {
+  // Limpiar asteriscos sueltos al final mientras el token aún está escribiéndose
+  const normalized = line.replace(/\*{1,2}$/, "");
+  const tokens = normalized.split(/(\*\*[^*]+\*\*|\*[^*]+\*|`[^`]+`)/g);
+
+  return tokens.map((part, i) => {
+    if (part.startsWith("**") && part.endsWith("**") && part.length > 4) {
+      return (
+        <strong key={i} className="font-semibold text-teal-200">
+          {part.slice(2, -2)}
+        </strong>
+      );
+    }
+    if (part.startsWith("*") && part.endsWith("*") && part.length > 2) {
+      return (
+        <em key={i} className="italic text-slate-100">
+          {part.slice(1, -1)}
+        </em>
+      );
+    }
+    if (part.startsWith("`") && part.endsWith("`") && part.length > 2) {
+      return (
+        <code
+          key={i}
+          className="px-1 py-0.5 rounded bg-slate-800 text-cyan-300 font-hud text-[11px]"
+        >
+          {part.slice(1, -1)}
+        </code>
+      );
+    }
+    return <React.Fragment key={i}>{part}</React.Fragment>;
+  });
+}
+
+function MarkdownMessage({ content }: { content: string }) {
+  const lines = content.split("\n");
+
+  return (
+    <div className="space-y-1.5">
+      {lines.map((rawLine, idx) => {
+        const line = rawLine.trim();
+        if (!line) return <div key={idx} className="h-1" />;
+
+        // Encabezados Markdown (### Título)
+        const headingMatch = line.match(/^#{1,4}\s+(.*)$/);
+        if (headingMatch) {
+          return (
+            <p key={idx} className="font-semibold text-amber-300 text-xs pt-0.5">
+              {renderInlineMarkdown(headingMatch[1])}
+            </p>
+          );
+        }
+
+        // Viñetas (- ítem o * ítem)
+        const bulletMatch = line.match(/^[-*•]\s+(.*)$/);
+        if (bulletMatch) {
+          return (
+            <div key={idx} className="flex items-start gap-2 pl-1">
+              <span className="text-teal-400 mt-0.5">•</span>
+              <span className="flex-1">{renderInlineMarkdown(bulletMatch[1])}</span>
+            </div>
+          );
+        }
+
+        return <p key={idx}>{renderInlineMarkdown(line)}</p>;
+      })}
+    </div>
+  );
+}
+
 function buildPsiRagReport(ctx: ContextOut, question?: string): string {
   const { finding, environment, evidence } = ctx;
   const o2Pct = Math.round(environment.o2_fraction * 100);
@@ -37,7 +118,13 @@ function buildPsiRagReport(ctx: ContextOut, question?: string): string {
 
   if (question) {
     const q = question.toLowerCase();
-    if (q.includes("eva") || q.includes("traje") || q.includes("luna") || q.includes("peligro") || q.includes("usar")) {
+    if (
+      q.includes("eva") ||
+      q.includes("traje") ||
+      q.includes("luna") ||
+      q.includes("peligro") ||
+      q.includes("usar")
+    ) {
       return `**Veredicto PSI (${environment.label}):** ${
         isCritical
           ? `ALTO RIESGO / RESTRINGIDO. A ${o2Pct}% O₂ (${psi} psi) la inflamabilidad de ${
@@ -46,7 +133,12 @@ function buildPsiRagReport(ctx: ContextOut, question?: string): string {
           : `RIESGO CONTROLADO bajo atmósfera estándar (${o2Pct}% O₂, ${psi} psi), sujeto a control de flujo.`
       }\n**Factor dominante:** ${topFactor} con ${finding.observations} corridas experimentales.`;
     }
-    if (q.includes("apag") || q.includes("supres") || q.includes("preven") || q.includes("mitig")) {
+    if (
+      q.includes("apag") ||
+      q.includes("supres") ||
+      q.includes("preven") ||
+      q.includes("mitig")
+    ) {
       return `**Control recomendado:** Limitar exposición de ${
         finding.material || "combustibles"
       } en atmósferas >30% O₂, aplicar dilución supresora con CO₂ o He (protocolo FLEX) y mantener evacuación por debajo de ${
@@ -76,44 +168,94 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
   const [rules, setRules] = useState<RulesOut | null>(null);
   const [mode, setMode] = useState<"finding" | "rules" | "ask">("finding");
 
-  // Modelos locales del visitante (si tiene Ollama abierto)
+  // Estado de voz (activable / desactivable)
+  const [voiceEnabled, setVoiceEnabled] = useState(false);
+  const [voiceAvailable, setVoiceAvailable] = useState(false);
+
+  // Modelos locales vs PSI-RAG
   const [models, setModels] = useState<string[]>([]);
-  const [selectedModel, setSelectedModel] = useState<string>("");
-  const [modelReady, setModelReady] = useState(false);
+  const [selectedModel, setSelectedModel] = useState<string>(RAG_MODE);
+  const [scanning, setScanning] = useState(false);
+  const [modelReady, setModelReady] = useState(true);
   const [loadingModel, setLoadingModel] = useState(false);
 
   const [aiExplanation, setAiExplanation] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [question, setQuestion] = useState("");
 
-  const prevModelRef = useRef<string>("");
+  const prevModelRef = useRef<string>(RAG_MODE);
   const warmupAbortRef = useRef<AbortController | null>(null);
   const streamAbortRef = useRef<AbortController | null>(null);
+  const speakerRef = useRef<ReturnType<typeof createStreamSpeaker> | null>(null);
+  const voiceEnabledRef = useRef(voiceEnabled);
 
-  const hasLocalOllama = models.length > 0;
-
-  // 1. Detectar si el usuario que abre la web tiene Ollama corriendo en su PC
   useEffect(() => {
-    getOllamaModels().then((list) => {
-      setModels(list);
-      if (list.length > 0) {
-        const preferred =
-          list.find((m) => m.includes("1b")) ||
-          list.find((m) => m.includes("1.5b") || m.includes("2b")) ||
-          list.find((m) => m.includes("3b")) ||
-          list[0];
-        setSelectedModel(preferred);
-      }
-    });
-    api.rules().then(setRules).catch(() => {});
+    voiceEnabledRef.current = voiceEnabled;
+    if (!voiceEnabled) {
+      speakerRef.current?.cancel();
+      stopVoice();
+    }
+  }, [voiceEnabled]);
+
+  useEffect(() => {
+    setVoiceAvailable(isVoiceSupported());
+    return () => stopVoice();
   }, []);
 
-  // 2. Si el usuario sí tiene Ollama y cambia de modelo, cortar proceso previo y pre-cargar en su GPU
-  useEffect(() => {
-    if (!selectedModel) return;
+  const toggleVoice = () => {
+    setVoiceEnabled((prev) => {
+      const next = !prev;
+      if (next && aiExplanation && !streaming) {
+        speakText(aiExplanation);
+      } else if (!next) {
+        speakerRef.current?.cancel();
+        stopVoice();
+      }
+      return next;
+    });
+  };
 
+  const scanLocalModels = useCallback(async () => {
+    setScanning(true);
+    const list = await getOllamaModels();
+    setModels(list);
+    if (list.length > 0) {
+      const preferred =
+        list.find((m) => m.includes("1b")) ||
+        list.find((m) => m.includes("1.5b") || m.includes("2b")) ||
+        list.find((m) => m.includes("3b")) ||
+        list[0];
+      setSelectedModel((curr) =>
+        curr !== RAG_MODE && list.includes(curr) ? curr : preferred
+      );
+    } else {
+      setSelectedModel(RAG_MODE);
+    }
+    setScanning(false);
+  }, []);
+
+  useEffect(() => {
+    scanLocalModels();
+    api.rules().then(setRules).catch(() => {});
+  }, [scanLocalModels]);
+
+  // Gestionar cambio entre PSI-RAG y modelos locales de GPU
+  useEffect(() => {
     streamAbortRef.current?.abort();
     warmupAbortRef.current?.abort();
+    speakerRef.current?.cancel();
+    stopVoice();
+
+    if (selectedModel === RAG_MODE) {
+      if (prevModelRef.current && prevModelRef.current !== RAG_MODE) {
+        unloadOllamaModel(prevModelRef.current);
+      }
+      prevModelRef.current = RAG_MODE;
+      setLoadingModel(false);
+      setModelReady(true);
+      setStreaming(false);
+      return;
+    }
 
     const controller = new AbortController();
     warmupAbortRef.current = controller;
@@ -124,7 +266,11 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
     setAiExplanation("");
 
     const switchModel = async () => {
-      if (prevModelRef.current && prevModelRef.current !== selectedModel) {
+      if (
+        prevModelRef.current &&
+        prevModelRef.current !== RAG_MODE &&
+        prevModelRef.current !== selectedModel
+      ) {
         await unloadOllamaModel(prevModelRef.current);
       }
       prevModelRef.current = selectedModel;
@@ -140,10 +286,13 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
     return () => controller.abort();
   }, [selectedModel]);
 
-  // 3. Cargar contexto PSI y generar explicación (con Ollama local si existe, o RAG PSI inmediato si no)
+  // Ejecutar análisis + locución si la voz está activa
   useEffect(() => {
     if (!activeFinding) return;
     let cancelled = false;
+
+    speakerRef.current?.cancel();
+    stopVoice();
 
     setOpen(true);
     setMode("finding");
@@ -155,9 +304,10 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
         if (cancelled) return;
         setContext(ctx);
 
-        // Si el visitante no tiene Ollama o aún no está listo, mostrar RAG PSI al instante
-        if (!hasLocalOllama || !modelReady || !selectedModel) {
-          setAiExplanation(buildPsiRagReport(ctx));
+        if (selectedModel === RAG_MODE || !modelReady) {
+          const report = buildPsiRagReport(ctx);
+          setAiExplanation(report);
+          if (voiceEnabledRef.current) speakText(report);
           return;
         }
 
@@ -165,16 +315,33 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
         const controller = new AbortController();
         streamAbortRef.current = controller;
 
+        const streamSpeaker = createStreamSpeaker();
+        speakerRef.current = streamSpeaker;
+        let latestText = "";
+
         setStreaming(true);
         askOllamaStream({
           model: selectedModel,
           context: ctx,
           signal: controller.signal,
-          onToken: (text) => setAiExplanation(text),
+          onToken: (text) => {
+            latestText = text;
+            setAiExplanation(text);
+            if (voiceEnabledRef.current) {
+              streamSpeaker.pushAccumulated(text);
+            }
+          },
         })
+          .then(() => {
+            if (!controller.signal.aborted && voiceEnabledRef.current) {
+              streamSpeaker.flush(latestText);
+            }
+          })
           .catch((err) => {
             if (err?.name !== "AbortError") {
-              setAiExplanation(buildPsiRagReport(ctx));
+              const fallback = buildPsiRagReport(ctx);
+              setAiExplanation(fallback);
+              if (voiceEnabledRef.current) speakText(fallback);
             }
           })
           .finally(() => {
@@ -186,26 +353,35 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
     return () => {
       cancelled = true;
       streamAbortRef.current?.abort();
+      speakerRef.current?.cancel();
     };
-  }, [activeFinding, environmentKey, hasLocalOllama, modelReady, selectedModel]);
+  }, [activeFinding, environmentKey, modelReady, selectedModel]);
 
   const handleAsk = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!question.trim() || !context) return;
 
+    speakerRef.current?.cancel();
+    stopVoice();
+
     const q = question;
     setQuestion("");
     setMode("finding");
 
-    // Fallback instantáneo si el visitante no tiene Ollama local
-    if (!hasLocalOllama || !modelReady || !selectedModel) {
-      setAiExplanation(buildPsiRagReport(context, q));
+    if (selectedModel === RAG_MODE || !modelReady) {
+      const answer = buildPsiRagReport(context, q);
+      setAiExplanation(answer);
+      if (voiceEnabledRef.current) speakText(answer);
       return;
     }
 
     streamAbortRef.current?.abort();
     const controller = new AbortController();
     streamAbortRef.current = controller;
+
+    const streamSpeaker = createStreamSpeaker();
+    speakerRef.current = streamSpeaker;
+    let latestText = "";
 
     setAiExplanation("");
     setStreaming(true);
@@ -216,10 +392,21 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
         context,
         userQuestion: q,
         signal: controller.signal,
-        onToken: (text) => setAiExplanation(text),
+        onToken: (text) => {
+          latestText = text;
+          setAiExplanation(text);
+          if (voiceEnabledRef.current) {
+            streamSpeaker.pushAccumulated(text);
+          }
+        },
       });
+      if (!controller.signal.aborted && voiceEnabledRef.current) {
+        streamSpeaker.flush(latestText);
+      }
     } catch {
-      setAiExplanation(buildPsiRagReport(context, q));
+      const fallback = buildPsiRagReport(context, q);
+      setAiExplanation(fallback);
+      if (voiceEnabledRef.current) speakText(fallback);
     } finally {
       if (!controller.signal.aborted) setStreaming(false);
     }
@@ -237,10 +424,11 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
     );
   }
 
-  const canAsk = !hasLocalOllama || modelReady;
+  const isLocalModel = selectedModel !== RAG_MODE;
+  const canAsk = !isLocalModel || modelReady;
 
   return (
-    <div className="fixed left-16 bottom-5 z-30 w-[360px] sm:w-[420px] rounded-2xl bg-slate-950/95 backdrop-blur-xl border border-slate-800 shadow-2xl p-3.5">
+    <div className="fixed left-16 bottom-5 z-30 w-[360px] sm:w-[430px] rounded-2xl bg-slate-950/95 backdrop-blur-xl border border-slate-800 shadow-2xl p-3.5">
       {/* Cabecera */}
       <div className="flex items-start justify-between gap-2">
         <div className="flex items-center gap-2.5 min-w-0">
@@ -253,34 +441,64 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
                 FLAMEY SI
               </span>
 
-              {hasLocalOllama ? (
+              {models.length > 0 ? (
                 <select
                   value={selectedModel}
                   onChange={(e) => setSelectedModel(e.target.value)}
                   className="bg-slate-900 border border-emerald-500/40 rounded px-1.5 py-0.5 font-hud text-[10px] text-emerald-300 max-w-[145px] truncate cursor-pointer"
-                  title="Modelo local detectado en tu PC"
                 >
                   {models.map((m) => (
                     <option key={m} value={m}>
                       {m}
                     </option>
                   ))}
+                  <option value={RAG_MODE}>PSI-RAG (Sin GPU)</option>
                 </select>
               ) : (
-                <span
-                  className="inline-flex items-center gap-1 bg-teal-950/80 border border-teal-500/40 rounded px-1.5 py-0.5 font-hud text-[10px] text-teal-300"
-                  title="Motor de síntesis basado directamente en evidencia PSI"
-                >
+                <span className="inline-flex items-center gap-1 bg-teal-950/80 border border-teal-500/40 rounded px-1.5 py-0.5 font-hud text-[10px] text-teal-300">
                   <Database className="w-2.5 h-2.5" /> PSI-RAG
                 </span>
               )}
 
-              {hasLocalOllama && loadingModel && (
+              <button
+                onClick={scanLocalModels}
+                disabled={scanning}
+                title="Re-escanear modelos locales de Ollama"
+                className="p-1 rounded bg-slate-900 hover:bg-slate-800 border border-slate-700 text-slate-300 cursor-pointer"
+              >
+                <RefreshCw className={`w-2.5 h-2.5 ${scanning ? "animate-spin" : ""}`} />
+              </button>
+
+              {voiceAvailable && (
+                <button
+                  onClick={toggleVoice}
+                  title={voiceEnabled ? "Desactivar voz de Flamey" : "Activar voz de Flamey"}
+                  className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border font-hud text-[10px] transition cursor-pointer ${
+                    voiceEnabled
+                      ? "bg-teal-500/20 border-teal-400 text-teal-200"
+                      : "bg-slate-900 border-slate-700 text-slate-400 hover:text-slate-200"
+                  }`}
+                >
+                  {voiceEnabled ? (
+                    <>
+                      <Volume2 className="w-3 h-3 text-teal-300 animate-pulse" />
+                      <span>Voz ON</span>
+                    </>
+                  ) : (
+                    <>
+                      <VolumeX className="w-3 h-3" />
+                      <span>Voz OFF</span>
+                    </>
+                  )}
+                </button>
+              )}
+
+              {isLocalModel && loadingModel && (
                 <span className="inline-flex items-center gap-1 font-hud text-[9px] text-amber-300">
-                  <Loader2 className="w-3 h-3 animate-spin" /> Cargando GPU...
+                  <Loader2 className="w-3 h-3 animate-spin" /> GPU...
                 </span>
               )}
-              {hasLocalOllama && modelReady && !loadingModel && (
+              {isLocalModel && modelReady && !loadingModel && (
                 <span className="font-hud text-[9px] text-emerald-400">● Local</span>
               )}
             </div>
@@ -293,7 +511,10 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
           </div>
         </div>
         <button
-          onClick={() => setOpen(false)}
+          onClick={() => {
+            stopVoice();
+            setOpen(false);
+          }}
           className="text-slate-500 hover:text-slate-300 cursor-pointer"
         >
           <X className="w-4 h-4" />
@@ -303,14 +524,14 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
       {/* Cuerpo */}
       {mode === "finding" && context && (
         <div className="mt-3 space-y-2.5 max-h-64 overflow-y-auto pr-1">
-          {hasLocalOllama && loadingModel ? (
+          {isLocalModel && loadingModel ? (
             <div className="p-3 rounded-lg bg-slate-900/90 border border-amber-500/30 font-hud text-xs text-amber-300 flex items-center gap-2">
               <Loader2 className="w-4 h-4 animate-spin shrink-0" />
               Cargando {selectedModel} en tu GPU...
             </div>
           ) : (
-            <div className="text-xs text-slate-200 leading-relaxed bg-slate-900/90 p-3 rounded-lg border border-slate-800 whitespace-pre-line">
-              {aiExplanation || buildPsiRagReport(context)}
+            <div className="text-xs text-slate-200 leading-relaxed bg-slate-900/90 p-3 rounded-lg border border-slate-800">
+              <MarkdownMessage content={aiExplanation || buildPsiRagReport(context)} />
               {streaming && (
                 <span className="inline-block w-1.5 h-3.5 ml-1 bg-teal-400 animate-pulse align-middle" />
               )}
@@ -325,7 +546,7 @@ export function FlameyWidget({ activeFinding, environmentKey }: Props) {
               key={idx}
               className="p-2 rounded bg-slate-900/75 border border-slate-800 font-hud text-[10px] text-slate-300 flex justify-between"
             >
-              <span className="truncate max-w-[230px] text-cyan-300">{ev.file}</span>
+              <span className="truncate max-w-[235px] text-cyan-300">{ev.file}</span>
               <span>
                 Fila #{ev.row} · Q {Math.round(ev.quality * 100)}%
               </span>
